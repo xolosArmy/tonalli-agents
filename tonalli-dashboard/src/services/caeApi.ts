@@ -1,6 +1,7 @@
 export type CaeDecision = "approve" | "deny";
 export type CaeStatusDetail = "ONLINE" | "RESPONDING" | "OFFLINE";
 export type TribunalAgentStatus = "online" | "syncing" | "guarded";
+export type ActiveRFCState = "ACTIVE" | "NONE";
 
 export type TribunalAgent = {
   id: string;
@@ -8,6 +9,13 @@ export type TribunalAgent = {
   role: string;
   status: TribunalAgentStatus;
   lastPulse: string;
+};
+
+export type ActiveRFC = {
+  status: ActiveRFCState;
+  filename: string | null;
+  timestamp: number | null;
+  ageMs: number | null;
 };
 
 type CaeHealthResponse = {
@@ -52,6 +60,7 @@ const DEFAULT_CAE_API_BASE_URL = "/api/cae";
 const HEALTH_PATH = "/v1/health";
 const LOGS_PATH = "/v1/logs";
 const AGENTS_PATH = "/v1/agents";
+const RFC_LATEST_PATH = "/v1/rfc/latest";
 
 function getCaeApiBaseUrl() {
   const configuredBaseUrl = import.meta.env.VITE_CAE_API_BASE_URL;
@@ -75,6 +84,10 @@ export function getCaeAgentsEndpoint() {
   return `${getCaeApiBaseUrl()}${AGENTS_PATH}`;
 }
 
+export function getCaeLatestRfcEndpoint() {
+  return `${getCaeApiBaseUrl()}${RFC_LATEST_PATH}`;
+}
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
 
@@ -83,6 +96,31 @@ async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   }
 
   return (await response.json()) as T;
+}
+
+function createEmptyActiveRfc(): ActiveRFC {
+  return {
+    status: "NONE",
+    filename: null,
+    timestamp: null,
+    ageMs: null
+  };
+}
+
+function normalizeActiveRfc(payload: unknown): ActiveRFC {
+  if (!payload || typeof payload !== "object") {
+    return createEmptyActiveRfc();
+  }
+
+  const record = payload as Record<string, unknown>;
+  const status = record.status === "ACTIVE" ? "ACTIVE" : "NONE";
+
+  return {
+    status,
+    filename: status === "ACTIVE" && typeof record.filename === "string" ? record.filename : null,
+    timestamp: typeof record.timestamp === "number" ? record.timestamp : null,
+    ageMs: typeof record.ageMs === "number" ? record.ageMs : null
+  };
 }
 
 function normalizeHealth(payload: CaeHealthResponse): CaeStatus {
@@ -410,4 +448,17 @@ export async function fetchTribunalAgents(signal?: AbortSignal): Promise<Tribuna
   });
 
   return extractAgentEntries(payload).map(normalizeAgentEntry);
+}
+
+export async function fetchActiveRFC(signal?: AbortSignal): Promise<ActiveRFC> {
+  try {
+    const payload = await requestJson<unknown>(getCaeLatestRfcEndpoint(), {
+      method: "GET",
+      signal
+    });
+
+    return normalizeActiveRfc(payload);
+  } catch {
+    return createEmptyActiveRfc();
+  }
 }

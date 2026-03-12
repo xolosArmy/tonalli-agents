@@ -16,6 +16,7 @@ const HEALTH_PATH = '/v1/health';
 const LOGS_PATH = '/v1/logs';
 const PREFLIGHT_PATH = '/v1/preflight/sign';
 const AGENTS_PATH = '/v1/agents';
+const RFC_LATEST_PATH = '/v1/rfc/latest';
 const MAX_LOG_ENTRIES = 200;
 
 const serverStartedAt = Date.now();
@@ -336,8 +337,58 @@ function createHealthPayload() {
     dailyLimitSats: DAILY_LIMIT_SATS,
     agentId: process.env.AGENT_ID || null,
     agentRole: process.env.AGENT_ROLE || null,
-    routes: [HEALTH_PATH, LOGS_PATH, AGENTS_PATH, PREFLIGHT_PATH],
+    routes: [HEALTH_PATH, LOGS_PATH, AGENTS_PATH, RFC_LATEST_PATH, PREFLIGHT_PATH],
   };
+}
+
+function createEmptyRfcPayload() {
+  return {
+    status: 'NONE',
+    filename: null,
+    timestamp: null,
+    ageMs: null,
+  };
+}
+
+function readLatestRfcDraft() {
+  try {
+    const draftsDirectory = path.join(__dirname, 'teyolia-agent', 'drafts');
+
+    if (!fs.existsSync(draftsDirectory)) {
+      return createEmptyRfcPayload();
+    }
+
+    const latestEntry = fs.readdirSync(draftsDirectory)
+      .filter((fileName) => fileName.startsWith('rfc-') && fileName.endsWith('.md'))
+      .map((fileName) => {
+        const filePath = path.join(draftsDirectory, fileName);
+        const fileStat = fs.statSync(filePath);
+
+        return {
+          filename: fileName,
+          timestamp: fileStat.mtimeMs,
+        };
+      })
+      .sort((left, right) => right.timestamp - left.timestamp)[0];
+
+    if (!latestEntry) {
+      return createEmptyRfcPayload();
+    }
+
+    const ageMs = Date.now() - latestEntry.timestamp;
+    if (ageMs >= 86400000) {
+      return createEmptyRfcPayload();
+    }
+
+    return {
+      status: 'ACTIVE',
+      filename: latestEntry.filename,
+      timestamp: latestEntry.timestamp,
+      ageMs,
+    };
+  } catch {
+    return createEmptyRfcPayload();
+  }
 }
 
 pushLogEntry({
@@ -392,11 +443,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && urlObject.pathname === RFC_LATEST_PATH) {
+    sendJson(res, 200, readLatestRfcDraft());
+    return;
+  }
+
   if (req.method !== 'POST' || urlObject.pathname !== PREFLIGHT_PATH) {
     sendJson(res, 404, {
       ok: false,
       error: 'Not found',
-      expected: [`GET ${HEALTH_PATH}`, `GET ${LOGS_PATH}`, `GET ${AGENTS_PATH}`, `POST ${PREFLIGHT_PATH}`],
+      expected: [`GET ${HEALTH_PATH}`, `GET ${LOGS_PATH}`, `GET ${AGENTS_PATH}`, `GET ${RFC_LATEST_PATH}`, `POST ${PREFLIGHT_PATH}`],
     });
     return;
   }

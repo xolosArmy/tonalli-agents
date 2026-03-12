@@ -3,8 +3,10 @@ import { activeIdentity } from "../config/activeIdentity";
 import { treasuryConfig } from "../config/treasury";
 import {
   checkCaeStatus,
+  fetchActiveRFC,
   fetchCaeStatus,
   getCaeStatusEndpoint,
+  type ActiveRFC,
   type CaeLiveStatus,
   type CaeStatus
 } from "../services/caeApi";
@@ -65,6 +67,12 @@ function getTreasurySignal(balance: ChronikAddressBalance) {
 }
 
 export function SystemPage() {
+  const [activeRFC, setActiveRFC] = useState<ActiveRFC>({
+    status: "NONE",
+    filename: null,
+    timestamp: null,
+    ageMs: null
+  });
   const [caeLiveStatus, setCaeLiveStatus] = useState<CaeLiveStatus>({
     online: false,
     detail: "RESPONDING"
@@ -98,10 +106,11 @@ export function SystemPage() {
       controller.abort();
       controller = new AbortController();
 
-      const [caeResult, chronikResult, treasuryResult] = await Promise.allSettled([
+      const [caeResult, chronikResult, treasuryResult, activeRfcResult] = await Promise.allSettled([
         fetchCaeStatus(controller.signal),
         checkChronikStatus(controller.signal),
-        getAddressBalance(activeIdentity.treasuryAddress ?? "", controller.signal)
+        getAddressBalance(activeIdentity.treasuryAddress ?? "", controller.signal),
+        fetchActiveRFC(controller.signal)
       ]);
 
       if (!active || controller.signal.aborted) {
@@ -143,6 +152,17 @@ export function SystemPage() {
           utxoCount: null,
           summary: "Chronik no expuso balance util para la direccion activa por el proxy local.",
           endpoint: getChronikAddressEndpoint(activeIdentity.treasuryAddress ?? "address")
+        });
+      }
+
+      if (activeRfcResult.status === "fulfilled") {
+        setActiveRFC(activeRfcResult.value);
+      } else {
+        setActiveRFC({
+          status: "NONE",
+          filename: null,
+          timestamp: null,
+          ageMs: null
         });
       }
     };
@@ -282,6 +302,34 @@ export function SystemPage() {
             </div>
             <div className={`badge badge-${treasurySignal.tone}`}>
               Umbral: {treasurySignal.thresholdLabel}
+            </div>
+          </div>
+
+          <div className="table-list">
+            <div className="table-row">
+              <div>
+                <strong>Funding Campaign</strong>
+                <p>Estado del ultimo RFC emitido por la memoria operativa de Teyolia</p>
+              </div>
+              <div className={`badge badge-${activeRFC.status === "ACTIVE" ? "guarded" : "neutral"}`}>
+                {activeRFC.status === "ACTIVE" ? "ACTIVE" : "STANDBY"}
+              </div>
+              <span>
+                {activeRFC.status === "ACTIVE"
+                  ? "Campana de fondeo con RFC vigente en las ultimas 24 horas."
+                  : "Sin RFC reciente dentro de la ventana operativa."}
+              </span>
+            </div>
+
+            <div className="table-row">
+              <div>
+                <strong>Latest RFC</strong>
+                <p>Ultimo borrador detectado en el repositorio institucional</p>
+              </div>
+              <div className={`badge badge-${activeRFC.status === "ACTIVE" ? "guarded" : "neutral"}`}>
+                {activeRFC.filename ?? "sin dato"}
+              </div>
+              <span>{activeRFC.filename ?? "No existe un RFC activo para exponer en esta vista."}</span>
             </div>
           </div>
 
