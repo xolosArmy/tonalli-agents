@@ -1,31 +1,46 @@
-import { requestPreflight } from "../cae/preflightClient";
-import { env } from "../config/env";
-import type { TxIntent } from "../types/policy";
+import {
+  AGENTIC_CONTRACT_VERSION,
+  parseAgenticWorkflowV1
+} from "@xolosarmy/tonalli-core";
+import { enforcePreflight } from "../cae/policyGuard";
+import {
+  createAgentPaymentIntent,
+  type AgentPaymentIntentInput
+} from "./intent";
 
-interface PreflightSendXecInput {
-  toAddress: string;
-  amountSats: number;
-  reason: string;
-  memo?: string;
-}
-
-export async function preflightSendXEC(input: PreflightSendXecInput) {
-  const intent: TxIntent = {
-    agentId: env.AGENT_ID,
-    agentRole: env.AGENT_ROLE,
-    fromAddress: env.AGENT_WALLET,
-    toAddress: input.toAddress,
-    amountSats: input.amountSats,
-    reason: input.reason,
-    memo: input.memo,
-    timestamp: new Date().toISOString()
-  };
-
-  const preflight = await requestPreflight(intent);
+export async function preflightSendXEC(input: AgentPaymentIntentInput) {
+  const intent = createAgentPaymentIntent(input);
+  const policyDecision = await enforcePreflight(intent);
+  const workflow = parseAgenticWorkflowV1({
+    contractVersion: AGENTIC_CONTRACT_VERSION,
+    kind: "agentic_workflow",
+    intent,
+    policyDecision,
+    signedTransaction: {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "signed_transaction",
+      status: "not_attempted",
+      intentId: intent.intentId
+    },
+    broadcast: {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "broadcast",
+      status: "not_attempted",
+      intentId: intent.intentId
+    },
+    confirmation: {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "confirmation",
+      status: "not_attempted",
+      intentId: intent.intentId
+    }
+  });
 
   return {
-    success: preflight.decision === "approved",
+    status: "preflight_only" as const,
+    simulation: true as const,
     intent,
-    preflight
+    policyDecision,
+    workflow
   };
 }

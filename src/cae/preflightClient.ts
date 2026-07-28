@@ -1,38 +1,58 @@
 import axios from "axios";
+import {
+  parseAgentIntentV1,
+  parseCaePolicyDecisionV1
+} from "@xolosarmy/tonalli-core";
 import { env } from "../config/env";
-import { TxIntent, PreflightResponse } from "../types/policy";
+import type { TxIntent, PreflightResponse } from "../types/policy";
 
 const client = axios.create({
   baseURL: env.CAE_PREFLIGHT_URL,
-  timeout: 10000
+  timeout: env.CAE_REQUEST_TIMEOUT_MS
 });
 
-export async function requestPreflight(intent: TxIntent): Promise<PreflightResponse> {
-  try {
-    // Aquí simulamos la llamada HTTP para este MVP.
-    // En producción, descomenta la siguiente línea:
-    // const { data } = await client.post("", intent);
-    // return data;
+export interface PreflightTransport {
+  post(url: string, body: unknown): Promise<{
+    data: unknown;
+    status: number;
+  }>;
+}
 
-    console.log(`[CAE PREFLIGHT] Evaluando intent de ${intent.agentId} por ${intent.amountSats} sats...`);
-    
-    // MOCK DEL CAE PARA PRUEBAS: Si supera el límite diario, falla.
-    if (intent.amountSats > env.AGENT_DAILY_LIMIT_SATS) {
-        return {
-            decision: "rejected",
-            reason: `Monto (${intent.amountSats}) supera el límite diario del agente (${env.AGENT_DAILY_LIMIT_SATS})`,
-            policyTraceId: `cae_mock_${Date.now()}`
-        }
-    }
-    
-    return {
-        decision: "approved",
-        reason: "Within A2/A3 policy threshold",
-        policyTraceId: `cae_mock_${Date.now()}`
-    };
+export class CaeFailClosedError extends Error {
+  readonly code = "CAE_FAIL_CLOSED";
 
-  } catch (error) {
-    console.error("[CAE PREFLIGHT] Error al consultar el Tribunal:", error);
-    throw error;
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "CaeFailClosedError";
   }
 }
+
+export const createPreflightRequester = (
+  transport: PreflightTransport = client
+) => async (input: TxIntent): Promise<PreflightResponse> => {
+  let intent: TxIntent;
+  try {
+    intent = parseAgentIntentV1(input);
+  } catch (error) {
+    throw new CaeFailClosedError("CAE request rejected an invalid intent", {
+      cause: error
+    });
+  }
+
+  try {
+    const response = await transport.post("", intent);
+    if (response.status < 200 || response.status >= 300) {
+      throw new CaeFailClosedError("CAE returned a non-success HTTP status");
+    }
+    const decision = parseCaePolicyDecisionV1(response.data);
+    if (decision.intentId !== intent.intentId) {
+      throw new CaeFailClosedError("CAE decision does not match the intent");
+    }
+    return decision;
+  } catch (error) {
+    if (error instanceof CaeFailClosedError) throw error;
+    throw new CaeFailClosedError("CAE request failed closed", { cause: error });
+  }
+};
+
+export const requestPreflight = createPreflightRequester();

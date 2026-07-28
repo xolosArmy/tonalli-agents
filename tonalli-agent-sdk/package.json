@@ -12,6 +12,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@xolosarmy/tonalli-core": "github:xolosArmy/tonalli-core#bbcea361579c18d00387c4f68ceeb53853a37328",
     "axios": "^1.13.6",
     "dotenv": "^17.3.1",
     "ecashaddrjs": "^2.0.0",

@@ -21,11 +21,11 @@ export const preflightSendCmd = new Command("preflight-send")
         memo: options.memo
       });
 
-      console.log(`✅ [DICTAMEN: ${result.preflight.decision.toUpperCase()}]`);
-      console.log(`   Razon:    ${result.preflight.reason}`);
+      console.log(`✅ [DICTAMEN: ${result.policyDecision.decision.toUpperCase()}]`);
+      console.log(`   Razon:    ${result.policyDecision.reason}`);
 
-      if (result.preflight.policyTraceId) {
-        console.log(`   Trace ID: ${result.preflight.policyTraceId}`);
+      if (result.policyDecision.policyTraceId) {
+        console.log(`   Trace ID: ${result.policyDecision.policyTraceId}`);
       }
 
       console.log("");

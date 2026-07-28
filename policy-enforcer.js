@@ -1,6 +1,11 @@
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { AGENTIC_CONTRACT_VERSION } = require('@xolosarmy/tonalli-core');
+const {
+  InvalidAgentIntentError,
+  createPolicyEngine,
+} = require('./src/cae/policyEngine.cjs');
 
 loadEnvFiles([
   path.join(__dirname, '.env'),
@@ -11,7 +16,13 @@ loadEnvFiles([
 
 const HOST = '127.0.0.1';
 const PORT = 8787;
-const DAILY_LIMIT_SATS = parsePositiveInteger(process.env.AGENT_DAILY_LIMIT_SATS, 0);
+const DAILY_LIMIT_SATS = process.env.AGENT_DAILY_LIMIT_SATS || '0';
+const ALLOWED_PAY_TO = parseCsv(process.env.AGENT_ALLOWED_PAY_TO);
+const AGENTIC_KILL_SWITCH = parseBoolean(process.env.AGENTIC_KILL_SWITCH, true);
+const DECISION_TTL_SECONDS = parsePositiveInteger(
+  process.env.CAE_DECISION_TTL_SECONDS,
+  60
+);
 const HEALTH_PATH = '/v1/health';
 const LOGS_PATH = '/v1/logs';
 const PREFLIGHT_PATH = '/v1/preflight/sign';
@@ -23,6 +34,12 @@ const ACTIVE_RFC_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 const serverStartedAt = Date.now();
 const activityLog = [];
+const defaultPolicyEngine = createPolicyEngine({
+  dailyLimitSats: DAILY_LIMIT_SATS,
+  allowedPayTo: ALLOWED_PAY_TO,
+  killSwitch: AGENTIC_KILL_SWITCH,
+  decisionTtlSeconds: DECISION_TTL_SECONDS,
+});
 
 function loadEnvFiles(filePaths) {
   filePaths.forEach((filePath) => {
@@ -55,6 +72,20 @@ function loadEnvFiles(filePaths) {
 function parsePositiveInteger(value, fallbackValue) {
   const parsed = Number.parseInt(String(value || ''), 10);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallbackValue;
+}
+
+function parseBoolean(value, fallbackValue) {
+  const normalized = String(value ?? '').trim().toLowerCase();
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+  return fallbackValue;
+}
+
+function parseCsv(value) {
+  return String(value ?? '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function parseEnvFile(filePath) {
@@ -287,26 +318,6 @@ function readJsonBody(req) {
   });
 }
 
-function extractRequestedSats(payload) {
-  const candidates = [
-    payload.amountSats,
-    payload.amount,
-    payload.sats,
-    payload.txSats,
-    payload?.tx?.amountSats,
-    payload?.tx?.amount,
-  ];
-
-  for (const candidate of candidates) {
-    const parsed = parsePositiveInteger(candidate, -1);
-    if (parsed >= 0) {
-      return parsed;
-    }
-  }
-
-  return null;
-}
-
 function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload, null, 2));
@@ -337,6 +348,9 @@ function createHealthPayload() {
     timestamp: new Date().toISOString(),
     uptimeMs: Date.now() - serverStartedAt,
     dailyLimitSats: DAILY_LIMIT_SATS,
+    contractVersion: AGENTIC_CONTRACT_VERSION,
+    killSwitch: AGENTIC_KILL_SWITCH,
+    allowlistSize: ALLOWED_PAY_TO.length,
     agentId: process.env.AGENT_ID || null,
     agentRole: process.env.AGENT_ROLE || null,
     routes: [HEALTH_PATH, LOGS_PATH, AGENTS_PATH, RFC_LATEST_PATH, RFC_CONTENT_LATEST_PATH, PREFLIGHT_PATH],
@@ -498,7 +512,8 @@ pushLogEntry({
   },
 });
 
-const server = http.createServer(async (req, res) => {
+function createPolicyServer(policyEngine = defaultPolicyEngine) {
+  return http.createServer(async (req, res) => {
   const urlObject = new URL(req.url || '/', `http://${req.headers.host || `${HOST}:${PORT}`}`);
 
   if (req.method === 'GET' && urlObject.pathname === HEALTH_PATH) {
@@ -559,77 +574,55 @@ const server = http.createServer(async (req, res) => {
 
   try {
     const payload = await readJsonBody(req);
-    const requestedSats = extractRequestedSats(payload);
-
-    if (requestedSats === null) {
-      pushLogEntry({
-        type: 'preflight',
-        route: PREFLIGHT_PATH,
-        decision: 'deny',
-        status: 'invalid',
-        summary: 'Missing amount in sats',
-        meta: {
-          acceptedFields: ['amountSats', 'amount', 'sats', 'txSats', 'tx.amountSats', 'tx.amount'],
-        },
-      });
-
-      sendJson(res, 400, {
-        ok: false,
-        decision: 'deny',
-        reason: 'Missing amount in sats',
-        acceptedFields: ['amountSats', 'amount', 'sats', 'txSats', 'tx.amountSats', 'tx.amount'],
-      });
-      return;
-    }
-
-    const approved = DAILY_LIMIT_SATS > 0 && requestedSats <= DAILY_LIMIT_SATS;
-    const responsePayload = {
-      ok: approved,
-      decision: approved ? 'approve' : 'deny',
-      constitutionalBasis: approved
-        ? 'Requested amount is within AGENT_DAILY_LIMIT_SATS'
-        : 'Requested amount exceeds AGENT_DAILY_LIMIT_SATS',
-      requestedSats,
-      dailyLimitSats: DAILY_LIMIT_SATS,
-      agentId: process.env.AGENT_ID || null,
-      agentRole: process.env.AGENT_ROLE || null,
-      timestamp: new Date().toISOString(),
-    };
+    const responsePayload = policyEngine.evaluate(payload);
 
     pushLogEntry({
       type: 'preflight',
       route: PREFLIGHT_PATH,
       decision: responsePayload.decision,
-      status: approved ? 'approved' : 'denied',
-      summary: responsePayload.constitutionalBasis,
-      requestedSats,
-      dailyLimitSats: DAILY_LIMIT_SATS,
+      status: responsePayload.decision,
+      summary: responsePayload.reason,
       meta: {
-        agentId: responsePayload.agentId,
-        agentRole: responsePayload.agentRole,
+        intentId: responsePayload.intentId,
+        reasonCode: responsePayload.reasonCode,
+        policyTraceId: responsePayload.policyTraceId,
       },
     });
 
-    sendJson(res, approved ? 200 : 403, responsePayload);
+    sendJson(res, 200, responsePayload);
   } catch (error) {
+    const invalidIntent = error instanceof InvalidAgentIntentError;
     pushLogEntry({
       type: 'preflight',
       route: PREFLIGHT_PATH,
-      decision: 'deny',
+      decision: 'rejected',
       status: 'error',
-      summary: error.message,
+      summary: invalidIntent ? 'Invalid canonical intent' : 'CAE internal failure',
     });
 
-    sendJson(res, 400, {
-      ok: false,
-      decision: 'deny',
-      reason: error.message,
+    sendJson(res, invalidIntent ? 400 : 500, {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: 'cae_error',
+      status: 'rejected',
+      errorCode: invalidIntent ? 'invalid_intent' : 'internal_error',
+      reason: invalidIntent
+        ? 'Intent failed canonical validation'
+        : 'CAE failed closed',
     });
   }
-});
+  });
+}
 
-server.listen(PORT, HOST, () => {
-  console.log(
-    `CAE listening on http://${HOST}:${PORT}${PREFLIGHT_PATH} with AGENT_DAILY_LIMIT_SATS=${DAILY_LIMIT_SATS}`
-  );
-});
+if (require.main === module) {
+  const server = createPolicyServer();
+  server.listen(PORT, HOST, () => {
+    console.log(
+      `CAE listening on http://${HOST}:${PORT}${PREFLIGHT_PATH} ` +
+      `contract=${AGENTIC_CONTRACT_VERSION} killSwitch=${AGENTIC_KILL_SWITCH}`
+    );
+  });
+}
+
+module.exports = {
+  createPolicyServer,
+};
