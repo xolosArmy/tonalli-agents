@@ -3,7 +3,7 @@ import { onEvent, Topics } from "../src/events/bus";
 import { env } from "../src/config/env";
 
 // Escuchamos los eventos como si fuéramos el Orchestrator
-onEvent(Topics.TX_SIGNED, (data) => console.log("🟢 EVENTO RECIBIDO: Transacción Firmada", data));
+onEvent(Topics.TX_NOT_IMPLEMENTED, (data) => console.log("⏸️ EVENTO RECIBIDO: Firma no implementada", data));
 onEvent(Topics.POLICY_REJECTED, (data) => console.log("🔴 EVENTO RECIBIDO: Violación de Política", data));
 
 async function main() {
@@ -15,7 +15,7 @@ async function main() {
       reason: "Pago de servidor VPS",
       memo: "Infraestructura xNS"
     });
-    console.log("✅ RESULTADO:", result.preflight.decision);
+    console.log("⏸️ RESULTADO:", result.status, result.policyDecision.decision);
   } catch (error: any) {
     console.error(error.message);
   }

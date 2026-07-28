@@ -28,23 +28,33 @@ export async function safeSendXEC(input: SafeSendXecInput) {
     // 2. Obligar al Preflight Constitucional
     const preflight = await enforcePreflight(intent);
 
-    // 3. Si pasa, firmar
-    const signed = await signApprovedIntent(intent);
+    // 3. La firma real pertenece a Tonalli Wallet y aún no está implementada.
+    const signedTransaction = await signApprovedIntent(intent);
 
-    // 4. Emitir el evento de éxito
-    emitEvent(Topics.TX_SIGNED, {
+    // 4. Emitir un estado no ejecutable, nunca un éxito de transacción.
+    emitEvent(Topics.TX_NOT_IMPLEMENTED, {
+      status: "not_implemented",
       agentId: intent.agentId,
       toAddress: intent.toAddress,
       amountSats: intent.amountSats,
-      policyTraceId: preflight.policyTraceId,
-      txidPreview: signed.txidPreview
+      policyTraceId: preflight.policyTraceId
     });
 
     return {
-      success: true,
+      status: "not_implemented" as const,
+      simulation: true as const,
       intent,
-      preflight,
-      signed
+      policyDecision: preflight,
+      humanApproval: {
+        status: "required" as const
+      },
+      signedTransaction,
+      broadcast: {
+        status: "not_attempted" as const
+      },
+      confirmation: {
+        status: "not_attempted" as const
+      }
     };
 
   } catch (error: any) {

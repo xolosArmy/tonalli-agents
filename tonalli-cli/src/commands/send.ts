@@ -21,9 +21,9 @@ export const sendCmd = new Command("send")
         memo: options.memo
       });
 
-      console.log("✅ [DICTAMEN: APROBADO] Transacción firmada y lista.");
-      console.log(`   Trace ID: ${result.preflight.policyTraceId}`);
-      console.log(`   TXID:     ${result.signed.txidPreview}\n`);
+      console.log("⏸️ [NO IMPLEMENTADO] La intención no fue firmada ni transmitida.");
+      console.log(`   Estado:   ${result.status}`);
+      console.log(`   Trace ID: ${result.policyDecision.policyTraceId ?? "no disponible"}\n`);
     } catch (e: any) {
       console.error(e.message);
       process.exit(1);

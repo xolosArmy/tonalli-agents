@@ -1,14 +1,24 @@
 import { TxIntent } from "../types/policy";
 
-export interface SignedTxResult {
-  txHex: string;
-  txidPreview: string;
+export interface SigningNotImplementedResult {
+  status: "not_implemented";
+  simulation: true;
+  reason: "wallet_signing_not_implemented";
 }
 
-export async function signApprovedIntent(intent: TxIntent): Promise<SignedTxResult> {
-  console.log(`[SIGNER] Firmando transacción aprobada hacia ${intent.toAddress}...`);
+/**
+ * Cycle 1 safety boundary.
+ *
+ * This function intentionally does not create, sign, or identify a
+ * transaction. Real signing must be implemented inside Tonalli Wallet.
+ */
+export async function signApprovedIntent(
+  intent: TxIntent
+): Promise<SigningNotImplementedResult> {
+  console.log(`[SIGNER] Firma no implementada para la intención hacia ${intent.toAddress}.`);
   return {
-    txHex: `signed_mock_tx_for_${intent.toAddress}_${intent.amountSats}`,
-    txidPreview: `mock_txid_${Date.now()}`
+    status: "not_implemented",
+    simulation: true,
+    reason: "wallet_signing_not_implemented"
   };
 }
