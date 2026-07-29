@@ -28,3 +28,6 @@ or broadcast.
 
 See [Cycle 1 security and compatibility](docs/agentic-security-cycle-1.md) for
 configuration, reproducible tests, downstream handoff, and migration details.
+
+Security Review Gate 1 is reproducible with Docker or Podman from an exact,
+clean commit. See [`docs/security-gate-1.md`](docs/security-gate-1.md).

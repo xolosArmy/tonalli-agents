@@ -1,0 +1,34 @@
+[
+  {
+    "id": "synthetic mock transaction id",
+    "pattern": "mock_txid"
+  },
+  {
+    "id": "synthetic signed transaction",
+    "pattern": "signed_mock_tx"
+  },
+  {
+    "id": "pre-broadcast transaction id preview",
+    "pattern": "txidPreview"
+  },
+  {
+    "id": "mock or leaked transaction hex field",
+    "pattern": "txHex"
+  },
+  {
+    "id": "execution-looking success result",
+    "pattern": "success\\s*:\\s*true"
+  },
+  {
+    "id": "signed-transaction event on the disabled path",
+    "pattern": "(?:Topics\\.)?TX_SIGNED"
+  },
+  {
+    "id": "legacy approve decision literal",
+    "pattern": "decision\\s*:\\s*['\\\"]approve['\\\"]"
+  },
+  {
+    "id": "legacy deny decision literal",
+    "pattern": "decision\\s*:\\s*['\\\"]deny['\\\"]"
+  }
+]

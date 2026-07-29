@@ -37,6 +37,19 @@ consume the same remaining limit. Cycle 1 state is process-local and
 conservative; restarting the CAE requires the kill-switch to be enabled again
 before any further evaluation.
 
+## In-memory security state
+
+Replay protection, consumed nonces, intent IDs, and cumulative-limit
+reservations exist only in the memory of one CAE process. They are not durable,
+shared, or atomically coordinated across processes. A restart clears them, and
+two or more instances can hold different replay and spending-limit views.
+
+These controls are therefore not suitable for multiple CAE instances or real
+funds. Cycle 1 must remain single-process and non-financial, with the
+kill-switch enabled and the monetary limit at zero. A later design requires a
+durable, transactional, shared store before any real-funds or multi-instance
+review can begin.
+
 ## Safe defaults
 
 The standalone CAE reads:
@@ -90,18 +103,17 @@ issues; this PR does not modify either repository.
 
 ## Reproducible verification
 
-From a clean checkout:
+Security Review Gate 1 supersedes host-only verification. From any checkout,
+run the versioned clean-clone container runner against the exact commit:
 
 ```sh
-npm ci
-npm test
-npm --prefix tonalli-agent-sdk ci
-npm --prefix tonalli-agent-sdk run check
-npm --prefix tonalli-agent-sdk run build
-npm --prefix tonalli-cli ci
-npm --prefix tonalli-cli run build
+./scripts/run-security-gate.sh <40-character-commit-sha>
 ```
 
 The test suite covers valid canonical decisions, unknown/missing/invalid CAE
 responses, network and status failures, replay, expiry, allowlist, cumulative
 limits, kill-switch behavior, and the non-executable workflow boundary.
+
+See [`security-gate-1.md`](security-gate-1.md) for the fixed Node image,
+Docker/Podman commands, evidence requirements, approval text, and
+commit-invalidation rule.
