@@ -10,7 +10,7 @@ const eventemitter3_1 = __importDefault(require("eventemitter3"));
 exports.bus = new eventemitter3_1.default();
 exports.Topics = {
     BALANCE_LOW: "treasury.balance_low",
-    TX_SIGNED: "treasury.tx.approved_and_signed",
+    TX_NOT_IMPLEMENTED: "treasury.tx.not_implemented",
     POLICY_REJECTED: "policy.rejected"
 };
 function emitEvent(topic, payload) {

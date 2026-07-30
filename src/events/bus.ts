@@ -4,7 +4,7 @@ export const bus = new EventEmitter();
 
 export const Topics = {
   BALANCE_LOW: "treasury.balance_low",
-  TX_SIGNED: "treasury.tx.approved_and_signed",
+  TX_NOT_IMPLEMENTED: "treasury.tx.not_implemented",
   POLICY_REJECTED: "policy.rejected"
 } as const;
 

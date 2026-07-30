@@ -11,14 +11,26 @@ declare module "@xolosarmy/tonalli-agent-sdk" {
     reason: string;
     memo?: string;
   }): Promise<{
-    preflight: {
+    status: "not_implemented";
+    simulation: true;
+    policyDecision: {
       decision: string;
       reason: string;
       policyTraceId?: string;
     };
-    signed: {
-      txHex: string;
-      txidPreview: string;
+    humanApproval: {
+      status: "required";
+    };
+    signedTransaction: {
+      status: "not_implemented";
+      simulation: true;
+      reason: "wallet_signing_not_implemented";
+    };
+    broadcast: {
+      status: "not_attempted";
+    };
+    confirmation: {
+      status: "not_attempted";
     };
   }>;
 

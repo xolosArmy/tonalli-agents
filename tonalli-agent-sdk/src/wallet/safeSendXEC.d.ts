@@ -6,10 +6,20 @@ interface SafeSendXecInput {
     memo?: string;
 }
 export declare function safeSendXEC(input: SafeSendXecInput): Promise<{
-    success: boolean;
+    status: "not_implemented";
+    simulation: true;
     intent: TxIntent;
-    preflight: import("../types/policy").PreflightResponse;
-    signed: import("./sessionSigner").SignedTxResult;
+    policyDecision: import("../types/policy").PreflightResponse;
+    humanApproval: {
+        status: "required";
+    };
+    signedTransaction: import("./sessionSigner").SigningNotImplementedResult;
+    broadcast: {
+        status: "not_attempted";
+    };
+    confirmation: {
+        status: "not_attempted";
+    };
 }>;
 export {};
 //# sourceMappingURL=safeSendXEC.d.ts.map
