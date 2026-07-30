@@ -6,8 +6,8 @@ This cycle normalizes the CAE boundary and contains risk. It does not activate
 real funds, Commerce Relay, A2/A3 autonomy, Wallet signing, broadcast, or
 Chronik confirmation.
 
-The SDK pins `@xolosarmy/tonalli-core` to commit
-`bbcea361579c18d00387c4f68ceeb53853a37328`, which defines agentic contract
+The SDK pins `@xolosarmy/tonalli-core` to the final `main` merge commit
+`cfe4cb1575b22ed258565717c000ac535aa98c67`, which defines agentic contract
 version `1.0`.
 
 ## Fail-closed behavior
