@@ -1,4 +1,18 @@
 declare module "@xolosarmy/tonalli-agent-sdk" {
+  type CanonicalDecision = {
+    contractVersion: "1.0";
+    kind: "cae_policy_decision";
+    decisionId: string;
+    intentId: string;
+    decision: "approved" | "rejected" | "needs_human_approval";
+    reasonCode: string;
+    reason: string;
+    policyTraceId: string;
+    policyVersion: string;
+    evaluatedAt: number;
+    expiresAt: number;
+  };
+
   export function getBalance(address: string): Promise<{
     address: string;
     sats: number;
@@ -11,26 +25,23 @@ declare module "@xolosarmy/tonalli-agent-sdk" {
     reason: string;
     memo?: string;
   }): Promise<{
-    status: "not_implemented";
+    status: "rejected" | "needs_human_approval" | "not_implemented";
     simulation: true;
-    policyDecision: {
-      decision: string;
-      reason: string;
-      policyTraceId?: string;
+    policyDecision: CanonicalDecision;
+    walletApprovalRequest?: {
+      contractVersion: "1.0";
+      kind: "wallet_approval_request";
+      purpose: "xec_payment";
+      requestId: string;
     };
-    humanApproval: {
-      status: "required";
-    };
-    signedTransaction: {
-      status: "not_implemented";
-      simulation: true;
-      reason: "wallet_signing_not_implemented";
-    };
-    broadcast: {
-      status: "not_attempted";
-    };
-    confirmation: {
-      status: "not_attempted";
+    workflow: {
+      contractVersion: "1.0";
+      kind: "agentic_workflow";
+      signedTransaction?: {
+        status: "not_attempted" | "not_implemented";
+      };
+      broadcast?: { status: "not_attempted" };
+      confirmation?: { status: "not_attempted" };
     };
   }>;
 
@@ -40,24 +51,12 @@ declare module "@xolosarmy/tonalli-agent-sdk" {
     reason: string;
     memo?: string;
   }): Promise<{
-    success: boolean;
-    intent: {
-      agentId: string;
-      agentRole: string;
-      fromAddress: string;
-      toAddress: string;
-      amountSats: number;
-      tokenId?: string;
-      tokenAmount?: string;
-      reason: string;
-      memo?: string;
-      timestamp: string;
-    };
-    preflight: {
-      decision: string;
-      reason: string;
-      policyTraceId?: string;
-      requiresApproval?: boolean;
+    status: "preflight_only";
+    simulation: true;
+    policyDecision: CanonicalDecision;
+    workflow: {
+      contractVersion: "1.0";
+      kind: "agentic_workflow";
     };
   }>;
 }

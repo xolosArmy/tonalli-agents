@@ -8,3 +8,4 @@ export * from "./types/policy";
 export * from "./wallet/safeSendXEC";
 export * from "./wallet/preflightSendXEC";
 export * from "./wallet/sessionSigner";
+export * from "./wallet/intent";

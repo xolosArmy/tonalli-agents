@@ -1,67 +1,152 @@
+import { randomUUID } from "node:crypto";
+import {
+  AGENTIC_CONTRACT_VERSION,
+  parseAgenticWorkflowV1,
+  parseWalletApprovalRequestV1
+} from "@xolosarmy/tonalli-core";
 import { enforcePreflight } from "../cae/policyGuard";
-import { signApprovedIntent } from "./sessionSigner";
+import type { PreflightRequester } from "../cae/policyGuard";
 import { emitEvent, Topics } from "../events/bus";
-import { env } from "../config/env";
-import { TxIntent } from "../types/policy";
+import {
+  createAgentPaymentIntent,
+  type AgentPaymentIntentInput,
+  type IntentFactoryOptions
+} from "./intent";
 
-interface SafeSendXecInput {
-  toAddress: string;
-  amountSats: number;
-  reason: string;
-  memo?: string;
+export interface SafeSendDependencies extends IntentFactoryOptions {
+  requestPolicy?: PreflightRequester;
 }
 
-export async function safeSendXEC(input: SafeSendXecInput) {
-  // 1. Construir el Intent
-  const intent: TxIntent = {
-    agentId: env.AGENT_ID,
-    agentRole: env.AGENT_ROLE,
-    fromAddress: env.AGENT_WALLET,
-    toAddress: input.toAddress,
-    amountSats: input.amountSats,
-    reason: input.reason,
-    memo: input.memo,
-    timestamp: new Date().toISOString()
-  };
+const signingNotAttempted = (intentId: string) => ({
+  contractVersion: AGENTIC_CONTRACT_VERSION,
+  kind: "signed_transaction" as const,
+  status: "not_attempted" as const,
+  intentId
+});
+
+const signingNotImplemented = (intentId: string) => ({
+  contractVersion: AGENTIC_CONTRACT_VERSION,
+  kind: "signed_transaction" as const,
+  status: "not_implemented" as const,
+  intentId,
+  reason: "wallet_signing_not_implemented" as const
+});
+
+const broadcastNotAttempted = (intentId: string) => ({
+  contractVersion: AGENTIC_CONTRACT_VERSION,
+  kind: "broadcast" as const,
+  status: "not_attempted" as const,
+  intentId
+});
+
+const confirmationNotAttempted = (intentId: string) => ({
+  contractVersion: AGENTIC_CONTRACT_VERSION,
+  kind: "confirmation" as const,
+  status: "not_attempted" as const,
+  intentId
+});
+
+export async function safeSendXEC(
+  input: AgentPaymentIntentInput,
+  dependencies: SafeSendDependencies = {}
+) {
+  const intent = createAgentPaymentIntent(input, dependencies);
+  const now = dependencies.now ?? (() => Math.floor(Date.now() / 1000));
 
   try {
-    // 2. Obligar al Preflight Constitucional
-    const preflight = await enforcePreflight(intent);
+    const policyDecision = dependencies.requestPolicy
+      ? await enforcePreflight(intent, dependencies.requestPolicy, now)
+      : await enforcePreflight(intent, undefined, now);
+    const stoppedStages = {
+      signedTransaction: signingNotAttempted(intent.intentId),
+      broadcast: broadcastNotAttempted(intent.intentId),
+      confirmation: confirmationNotAttempted(intent.intentId)
+    };
 
-    // 3. La firma real pertenece a Tonalli Wallet y aún no está implementada.
-    const signedTransaction = await signApprovedIntent(intent);
+    if (policyDecision.decision === "rejected") {
+      const workflow = parseAgenticWorkflowV1({
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "agentic_workflow",
+        intent,
+        policyDecision,
+        ...stoppedStages
+      });
+      emitEvent(Topics.POLICY_REJECTED, {
+        intentId: intent.intentId,
+        policyTraceId: policyDecision.policyTraceId,
+        reasonCode: policyDecision.reasonCode
+      });
+      return {
+        status: "rejected" as const,
+        simulation: true as const,
+        intent,
+        policyDecision,
+        workflow
+      };
+    }
 
-    // 4. Emitir un estado no ejecutable, nunca un éxito de transacción.
+    if (policyDecision.decision === "needs_human_approval") {
+      const requestedAt = now();
+      const expiresAt = Math.min(intent.expiresAt, policyDecision.expiresAt);
+      const randomId = dependencies.randomId ?? randomUUID;
+      const walletApprovalRequest = parseWalletApprovalRequestV1({
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "wallet_approval_request",
+        purpose: "xec_payment",
+        requestId: `wallet-request:${randomId()}`,
+        intent,
+        policyDecision,
+        requestedAt,
+        expiresAt
+      });
+      const workflow = parseAgenticWorkflowV1({
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "agentic_workflow",
+        intent,
+        policyDecision,
+        walletApprovalRequest,
+        ...stoppedStages
+      });
+      emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
+        intentId: intent.intentId,
+        requestId: walletApprovalRequest.requestId,
+        policyTraceId: policyDecision.policyTraceId
+      });
+      return {
+        status: "needs_human_approval" as const,
+        simulation: true as const,
+        intent,
+        policyDecision,
+        walletApprovalRequest,
+        workflow
+      };
+    }
+
+    const workflow = parseAgenticWorkflowV1({
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "agentic_workflow",
+      intent,
+      policyDecision,
+      signedTransaction: signingNotImplemented(intent.intentId),
+      broadcast: broadcastNotAttempted(intent.intentId),
+      confirmation: confirmationNotAttempted(intent.intentId)
+    });
     emitEvent(Topics.TX_NOT_IMPLEMENTED, {
       status: "not_implemented",
-      agentId: intent.agentId,
-      toAddress: intent.toAddress,
-      amountSats: intent.amountSats,
-      policyTraceId: preflight.policyTraceId
+      intentId: intent.intentId,
+      policyTraceId: policyDecision.policyTraceId
     });
-
     return {
       status: "not_implemented" as const,
       simulation: true as const,
       intent,
-      policyDecision: preflight,
-      humanApproval: {
-        status: "required" as const
-      },
-      signedTransaction,
-      broadcast: {
-        status: "not_attempted" as const
-      },
-      confirmation: {
-        status: "not_attempted" as const
-      }
+      policyDecision,
+      workflow
     };
-
   } catch (error: any) {
-    // Emitir el rechazo
     emitEvent(Topics.POLICY_REJECTED, {
-      agentId: intent.agentId,
-      error: error.message
+      intentId: intent.intentId,
+      error: error instanceof Error ? error.message : "Unknown fail-closed error"
     });
     throw error;
   }

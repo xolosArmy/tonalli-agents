@@ -1,21 +1,8 @@
-export type PreflightDecision = "approved" | "rejected" | "needs_human_approval";
+import type {
+  AgentIntentV1,
+  CaePolicyDecisionV1
+} from "@xolosarmy/tonalli-core";
 
-export interface TxIntent {
-  agentId: string;
-  agentRole: string;
-  fromAddress: string;
-  toAddress: string;
-  amountSats: number;
-  tokenId?: string;
-  tokenAmount?: string;
-  reason: string;
-  memo?: string;
-  timestamp: string;
-}
-
-export interface PreflightResponse {
-  decision: PreflightDecision;
-  reason: string;
-  policyTraceId?: string;
-  requiresApproval?: boolean;
-}
+export type PreflightDecision = CaePolicyDecisionV1["decision"];
+export type TxIntent = AgentIntentV1;
+export type PreflightResponse = CaePolicyDecisionV1;

@@ -22,5 +22,13 @@
   {
     "id": "signed-transaction event on the disabled path",
     "pattern": "(?:Topics\\.)?TX_SIGNED"
+  },
+  {
+    "id": "legacy approve decision literal",
+    "pattern": "decision\\s*:\\s*['\\\"]approve['\\\"]"
+  },
+  {
+    "id": "legacy deny decision literal",
+    "pattern": "decision\\s*:\\s*['\\\"]deny['\\\"]"
   }
 ]
