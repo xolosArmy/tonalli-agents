@@ -9,4 +9,4 @@ export * from "./wallet/safeSendXEC";
 export * from "./wallet/preflightSendXEC";
 export * from "./wallet/sessionSigner";
 export * from "./wallet/intent";
-export * from "./wallet/approvalConsumer";
+export * from "./wallet/approvalTransport";
