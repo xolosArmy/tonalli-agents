@@ -10,8 +10,9 @@ const EnvSchema = z.object({
   AGENT_ID: z.string().min(1),
   AGENT_ROLE: z.string().min(1),
   AGENT_WALLET: z.string().min(1),
-  AGENT_DAILY_LIMIT_SATS: z.coerce.number().int().nonnegative(),
-  AGENT_INTENT_TTL_SECONDS: z.coerce.number().int().positive().default(300)
+  AGENT_DAILY_LIMIT_SATS: z.coerce.number().int().nonnegative().default(0),
+  AGENT_INTENT_TTL_SECONDS: z.coerce.number().int().positive().default(300),
+  AGENTIC_KILL_SWITCH: z.coerce.boolean().default(true)
 });
 
 export const env = EnvSchema.parse(process.env);
