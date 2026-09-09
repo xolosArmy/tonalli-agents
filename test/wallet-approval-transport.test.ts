@@ -10,6 +10,7 @@ import {
   WalletApprovalTransportError,
   type WalletApprovalTransportPort
 } from "../src/wallet/approvalTransport";
+import { formatSatsToExactXEC } from "../src/wallet/format";
 
 const BASE_VALID_INTENT = {
   contractVersion: AGENTIC_CONTRACT_VERSION,
@@ -325,4 +326,48 @@ test("Agents boundary assertion: Agents does not possess approval authority", ()
   assert.equal((transport as any).recordHumanDecision, undefined);
   assert.equal((transport as any).processApprovalHandoff, undefined);
   assert.equal((transport as any).createHumanApproval, undefined);
+  assert.equal((transport as any).ApprovalRecordCapability, undefined);
+  assert.equal((transport as any).WalletLocalApprovalBinding, undefined);
 });
+
+test("Exact BigInt monetary formatting vectors without Number precision loss", () => {
+  // Test vectors specified by program security gate:
+  // 1
+  assert.equal(formatSatsToExactXEC("1"), "0.01 XEC");
+  // 99
+  assert.equal(formatSatsToExactXEC("99"), "0.99 XEC");
+  // 100
+  assert.equal(formatSatsToExactXEC("100"), "1.00 XEC");
+  // 5000
+  assert.equal(formatSatsToExactXEC("5000"), "50.00 XEC");
+  // Leading fraction zero
+  assert.equal(formatSatsToExactXEC("105"), "1.05 XEC");
+  assert.equal(formatSatsToExactXEC("1005"), "10.05 XEC");
+
+  // Number.MAX_SAFE_INTEGER = 9007199254740991
+  assert.equal(formatSatsToExactXEC("9007199254740991"), "90071992547409.91 XEC");
+  // Number.MAX_SAFE_INTEGER + 1 = 9007199254740992 (loses precision in double float)
+  assert.equal(formatSatsToExactXEC("9007199254740992"), "90071992547409.92 XEC");
+
+  // Core Golden Vector B3: 40 digits
+  const b3 = "1234567890123456789012345678901234567890";
+  assert.equal(
+    formatSatsToExactXEC(b3),
+    "12345678901234567890123456789012345678.90 XEC"
+  );
+});
+
+test("formatAuditDisplay displays byte-exact XEC amount even for huge integers", () => {
+  const transport = createWalletApprovalTransport();
+  const req = createValidRequest({
+    intent: {
+      ...BASE_VALID_INTENT,
+      amountSats: "9007199254740992"
+    }
+  });
+
+  const display = transport.formatAuditDisplay(req);
+  assert.equal(display.amountSats, "9007199254740992");
+  assert.equal(display.amountXEC, "90071992547409.92 XEC");
+});
+

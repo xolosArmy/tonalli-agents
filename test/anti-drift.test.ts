@@ -8,6 +8,7 @@ const sdkSrc = path.resolve(process.cwd(), "tonalli-agent-sdk/src");
 
 const CORE_SECURITY_MODULES = [
   "wallet/approvalTransport.ts",
+  "wallet/format.ts",
   "config/env.ts",
   "wallet/safeSendXEC.ts",
   "wallet/sessionSigner.ts",

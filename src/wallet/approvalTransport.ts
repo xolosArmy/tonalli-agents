@@ -18,6 +18,12 @@
  * All testing with `xec:mainnet` envelopes is strictly:
  *   "schema-only mainnet-shaped simulation"
  * under AGENTIC_KILL_SWITCH=true and AGENT_DAILY_LIMIT_SATS=0 without signing or real funds.
+ *
+ * Hardened Receipt & Audit Boundary:
+ * - HumanApprovalV1 is strictly an auditable receipt/audit artifact, NEVER a signing authorization
+ *   or portable execution capability.
+ * - Agents NEVER receives WalletLocalApprovalBinding nor ApprovalRecordCapability.
+ * - A mock port that returns `approved` does NOT enable financial execution.
  */
 
 import {
@@ -27,6 +33,7 @@ import {
   type HumanApprovalV1,
   type WalletApprovalRequestV1
 } from "@xolosarmy/tonalli-core";
+import { formatSatsToExactXEC } from "./format";
 
 export const parseHumanApprovalV1 = (value: unknown): HumanApprovalV1 =>
   humanApprovalV1Schema.parse(value);
@@ -260,8 +267,7 @@ export function createWalletApprovalTransport(config: WalletApprovalTransportCon
    * Formats outbound request for read-only audit and user inspection.
    */
   function formatAuditDisplay(request: WalletApprovalRequestV1): WalletApprovalAuditDisplay {
-    const satsBig = BigInt(request.intent.amountSats);
-    const xecValue = (Number(satsBig) / 100).toFixed(2);
+    const amountXEC = formatSatsToExactXEC(request.intent.amountSats);
     return {
       requestId: request.requestId,
       intentId: request.intent.intentId,
@@ -269,7 +275,7 @@ export function createWalletApprovalTransport(config: WalletApprovalTransportCon
       agentId: request.intent.agentId,
       agentRole: request.intent.agentRole,
       amountSats: request.intent.amountSats,
-      amountXEC: `${xecValue} XEC`,
+      amountXEC,
       fromAddress: request.intent.fromAddress,
       destination: request.intent.toAddress,
       reason: request.intent.reason,
