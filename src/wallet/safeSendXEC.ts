@@ -2,11 +2,16 @@ import { randomUUID } from "node:crypto";
 import {
   AGENTIC_CONTRACT_VERSION,
   parseAgenticWorkflowV1,
-  parseWalletApprovalRequestV1
+  parseWalletApprovalRequestV1,
+  type HumanApprovalV1
 } from "@xolosarmy/tonalli-core";
 import { enforcePreflight } from "../cae/policyGuard";
 import type { PreflightRequester } from "../cae/policyGuard";
 import { emitEvent, Topics } from "../events/bus";
+import {
+  createWalletApprovalTransport,
+  type WalletApprovalTransportPort
+} from "./approvalTransport";
 import {
   createAgentPaymentIntent,
   type AgentPaymentIntentInput,
@@ -15,6 +20,10 @@ import {
 
 export interface SafeSendDependencies extends IntentFactoryOptions {
   requestPolicy?: PreflightRequester;
+  walletApprovalPort?: WalletApprovalTransportPort;
+  walletTransport?: ReturnType<typeof createWalletApprovalTransport>;
+  killSwitch?: boolean;
+  monetaryLimitSats?: number | bigint;
 }
 
 const signingNotAttempted = (intentId: string) => ({
@@ -99,12 +108,30 @@ export async function safeSendXEC(
         requestedAt,
         expiresAt
       });
+
+      let humanApproval: HumanApprovalV1 | undefined;
+      if (dependencies.walletApprovalPort) {
+        const transport =
+          dependencies.walletTransport ??
+          createWalletApprovalTransport({
+            killSwitch: dependencies.killSwitch ?? false,
+            monetaryLimitSats:
+              dependencies.monetaryLimitSats ?? intent.amountSats,
+            nowEpochSeconds: now
+          });
+        humanApproval = await transport.dispatchApprovalRequest(
+          walletApprovalRequest,
+          dependencies.walletApprovalPort
+        );
+      }
+
       const workflow = parseAgenticWorkflowV1({
         contractVersion: AGENTIC_CONTRACT_VERSION,
         kind: "agentic_workflow",
         intent,
         policyDecision,
         walletApprovalRequest,
+        ...(humanApproval ? { humanApproval } : {}),
         ...stoppedStages
       });
       emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
@@ -118,6 +145,7 @@ export async function safeSendXEC(
         intent,
         policyDecision,
         walletApprovalRequest,
+        ...(humanApproval ? { humanApproval } : {}),
         workflow
       };
     }
