@@ -41,6 +41,7 @@ export const parseHumanApprovalV1 = (value: unknown): HumanApprovalV1 =>
 export type WalletApprovalTransportErrorCode =
   | "KILL_SWITCH_ACTIVE"
   | "MONETARY_LIMIT_EXCEEDED"
+  | "MISSING_WALLET_TRANSPORT"
   | "INVALID_REQUEST_SCHEMA"
   | "INVALID_CONTRACT_VERSION"
   | "INVALID_KIND"

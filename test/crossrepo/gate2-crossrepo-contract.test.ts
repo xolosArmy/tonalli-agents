@@ -1,7 +1,7 @@
 /**
- * @file integration-safeSend-wallet-receiver.test.ts
+ * @file gate2-crossrepo-contract.test.ts
  *
- * CANONICAL INTEGRATED PIPELINE TEST (Gate 2A + Gate 2B)
+ * CROSS-REPO CONTRACT HARNESS (Gate 2A + Gate 2B)
  *
  * Topology:
  * safeSendXEC -> transport port -> wallet receiver -> presentation snapshot ->
@@ -14,7 +14,8 @@
  * Kill-switch and Limits Disclosure:
  * In production/default state, killSwitch=true and monetaryLimitSats=0 enforce complete freeze.
  * For this controlled pipeline simulation test, killSwitch=false and an explicit monetary limit
- * are injected solely to verify pipeline mechanics. Zero signing, zero keys, zero broadcast.
+ * are injected through a preconfigured transport solely to verify pipeline mechanics.
+ * Zero signing, zero keys, zero broadcast.
  */
 
 process.env.CHRONIK_URL = "http://127.0.0.1:1";
@@ -28,25 +29,37 @@ process.env.AGENT_INTENT_TTL_SECONDS = "300";
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import type {
-  WalletApprovalTransportPort
-} from "../src/wallet/approvalTransport.js";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  createWalletApprovalTransport,
+  type WalletApprovalTransportPort
+} from "../../src/wallet/approvalTransport.js";
 import type {
   CaePolicyDecisionV1,
   WalletApprovalRequestV1
 } from "@xolosarmy/tonalli-core";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const RMZ_WALLET_ROOT = process.env.RMZ_WALLET_ROOT
+  ? path.resolve(process.env.RMZ_WALLET_ROOT)
+  : path.resolve(__dirname, "../../../RMZWallet");
+
 async function loadPipelineModules() {
-  const { encodeAgentWalletHandoffV1 } = await import(
-    "../../RMZWallet/src/features/agentWalletHandoff/encoder.js"
-  );
-  const { createAgentWalletApprovalReceiver } = await import(
-    "../../RMZWallet/src/features/agentWalletApprovalReceiver/receiver.js"
-  );
-  const { InMemoryWalletApprovalLedger, createMockSessionVerifier } = await import(
-    "../../RMZWallet/src/features/agentWalletApprovalReceiver/testUtils.js"
-  );
-  const { safeSendXEC } = await import("../src/wallet/safeSendXEC.js");
+  const encoderUrl = pathToFileURL(
+    path.join(RMZ_WALLET_ROOT, "src/features/agentWalletHandoff/encoder.ts")
+  ).href;
+  const receiverUrl = pathToFileURL(
+    path.join(RMZ_WALLET_ROOT, "src/features/agentWalletApprovalReceiver/receiver.ts")
+  ).href;
+  const testUtilsUrl = pathToFileURL(
+    path.join(RMZ_WALLET_ROOT, "src/features/agentWalletApprovalReceiver/testUtils.ts")
+  ).href;
+
+  const { encodeAgentWalletHandoffV1 } = await import(encoderUrl);
+  const { createAgentWalletApprovalReceiver } = await import(receiverUrl);
+  const { InMemoryWalletApprovalLedger, createMockSessionVerifier } = await import(testUtilsUrl);
+  const { safeSendXEC } = await import("../../src/wallet/safeSendXEC.js");
 
   return {
     encodeAgentWalletHandoffV1,
@@ -78,7 +91,7 @@ function createApprovedPolicyDecisionFixture(intentId: string): CaePolicyDecisio
   };
 }
 
-test("Integrated Pipeline: safeSendXEC -> transport port -> wallet receiver -> human approval -> ledger -> audit receipt", async () => {
+test("Cross-Repo Contract Harness: safeSendXEC -> transport port -> wallet receiver -> human approval -> ledger -> audit receipt", async () => {
   const {
     encodeAgentWalletHandoffV1,
     createAgentWalletApprovalReceiver,
@@ -115,14 +128,18 @@ test("Integrated Pipeline: safeSendXEC -> transport port -> wallet receiver -> h
       capturedPresentation = reviewSession.presentation;
 
       // Human interaction: approve through verified custodian session
-      const humanApproval = await walletReceiver.approveHandle(
-        reviewSession.handle,
-        { approver: FROM_ADDRESS }
-      );
+      // Approver is resolved exclusively by sessionVerifier; no { approver } payload passed.
+      const humanApproval = await walletReceiver.approveHandle(reviewSession.handle);
 
       return humanApproval;
     }
   };
+
+  const simulationTransport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1_000_000,
+    nowEpochSeconds: () => SIMULATION_NOW
+  });
 
   // 3. Execute safeSendXEC in controlled simulation mode
   const result = await safeSendXEC(
@@ -141,13 +158,12 @@ test("Integrated Pipeline: safeSendXEC -> transport port -> wallet receiver -> h
       requestPolicy: async (candidate) =>
         createApprovedPolicyDecisionFixture(candidate.intentId),
       walletApprovalPort: walletPort,
-      killSwitch: false, // Explicitly disclosed non-default for simulation
-      monetaryLimitSats: 1_000_000 // Explicitly disclosed limit for simulation
+      walletTransport: simulationTransport
     }
   );
 
-  // 4. Verify that execution halted at needs_human_approval as a read-only audit receipt
-  assert.equal(result.status, "needs_human_approval");
+  // 4. Verify that execution resulted in human_approval_recorded as a read-only audit receipt
+  assert.equal(result.status, "human_approval_recorded");
   assert.equal(result.simulation, true);
   assert.ok(result.walletApprovalRequest);
   assert.ok(result.humanApproval);
@@ -191,7 +207,7 @@ test("Integrated Pipeline: safeSendXEC -> transport port -> wallet receiver -> h
   assert.equal(ledgerRecord.presentationHash, capturedPresentation.presentationHash);
 });
 
-test("Integrated Pipeline Negative: Custodian address mismatch fails closed", async () => {
+test("Cross-Repo Contract Harness Negative: Custodian address mismatch fails closed", async () => {
   const {
     encodeAgentWalletHandoffV1,
     createAgentWalletApprovalReceiver,
@@ -219,11 +235,15 @@ test("Integrated Pipeline Negative: Custodian address mismatch fails closed", as
     async sendApprovalRequest(request: WalletApprovalRequestV1) {
       const handoffBytes = encodeAgentWalletHandoffV1(request);
       const reviewSession = await walletReceiver.prepareHandoff(handoffBytes);
-      return walletReceiver.approveHandle(reviewSession.handle, {
-        approver: "ecash:qpm2qsznhks23z7629mms6s4cwef74vcwvy22gdx6a"
-      });
+      return walletReceiver.approveHandle(reviewSession.handle);
     }
   };
+
+  const simulationTransport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1_000_000,
+    nowEpochSeconds: () => SIMULATION_NOW
+  });
 
   await assert.rejects(
     async () => {
@@ -241,8 +261,7 @@ test("Integrated Pipeline Negative: Custodian address mismatch fails closed", as
           requestPolicy: async (candidate) =>
             createApprovedPolicyDecisionFixture(candidate.intentId),
           walletApprovalPort: walletPort,
-          killSwitch: false,
-          monetaryLimitSats: 1_000_000
+          walletTransport: simulationTransport
         }
       );
     },
@@ -250,7 +269,7 @@ test("Integrated Pipeline Negative: Custodian address mismatch fails closed", as
   );
 });
 
-test("Integrated Pipeline Negative: Human rejection records atomically into ledger and halts execution", async () => {
+test("Cross-Repo Contract Harness Negative: Human rejection records atomically into ledger and halts execution", async () => {
   const {
     encodeAgentWalletHandoffV1,
     createAgentWalletApprovalReceiver,
@@ -274,11 +293,16 @@ test("Integrated Pipeline Negative: Human rejection records atomically into ledg
       const handoffBytes = encodeAgentWalletHandoffV1(request);
       const reviewSession = await walletReceiver.prepareHandoff(handoffBytes);
       return walletReceiver.rejectHandle(reviewSession.handle, {
-        approver: FROM_ADDRESS,
         reason: "User denied transaction in UI modal"
       });
     }
   };
+
+  const simulationTransport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1_000_000,
+    nowEpochSeconds: () => SIMULATION_NOW
+  });
 
   const result = await safeSendXEC(
     {
@@ -294,12 +318,11 @@ test("Integrated Pipeline Negative: Human rejection records atomically into ledg
       requestPolicy: async (candidate) =>
         createApprovedPolicyDecisionFixture(candidate.intentId),
       walletApprovalPort: walletPort,
-      killSwitch: false,
-      monetaryLimitSats: 1_000_000
+      walletTransport: simulationTransport
     }
   );
 
-  assert.equal(result.status, "needs_human_approval");
+  assert.equal(result.status, "rejected");
   assert.equal(result.simulation, true);
   assert.ok(result.humanApproval);
   assert.equal(result.humanApproval.status, "rejected");

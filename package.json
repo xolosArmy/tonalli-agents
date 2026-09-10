@@ -4,7 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --import tsx --test test/*.test.ts"
+    "test": "node --import tsx --test test/*.test.ts",
+    "test:gate2-crossrepo": "bash ./scripts/gate2-crossrepo.sh",
+    "test:crossrepo:local": "node --import tsx --test test/crossrepo/gate2-crossrepo-contract.test.ts"
   },
   "keywords": [],
   "author": "",

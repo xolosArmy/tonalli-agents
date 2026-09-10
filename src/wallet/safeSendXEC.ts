@@ -10,6 +10,7 @@ import type { PreflightRequester } from "../cae/policyGuard";
 import { emitEvent, Topics } from "../events/bus";
 import {
   createWalletApprovalTransport,
+  WalletApprovalTransportError,
   type WalletApprovalTransportPort
 } from "./approvalTransport";
 import {
@@ -22,8 +23,6 @@ export interface SafeSendDependencies extends IntentFactoryOptions {
   requestPolicy?: PreflightRequester;
   walletApprovalPort?: WalletApprovalTransportPort;
   walletTransport?: ReturnType<typeof createWalletApprovalTransport>;
-  killSwitch?: boolean;
-  monetaryLimitSats?: number | bigint;
 }
 
 const signingNotAttempted = (intentId: string) => ({
@@ -111,15 +110,13 @@ export async function safeSendXEC(
 
       let humanApproval: HumanApprovalV1 | undefined;
       if (dependencies.walletApprovalPort) {
-        const transport =
-          dependencies.walletTransport ??
-          createWalletApprovalTransport({
-            killSwitch: dependencies.killSwitch ?? false,
-            monetaryLimitSats:
-              dependencies.monetaryLimitSats ?? intent.amountSats,
-            nowEpochSeconds: now
-          });
-        humanApproval = await transport.dispatchApprovalRequest(
+        if (!dependencies.walletTransport) {
+          throw new WalletApprovalTransportError(
+            "MISSING_WALLET_TRANSPORT",
+            "walletApprovalPort was provided without a preconfigured walletTransport. Fail-closed: transport must be explicitly composed."
+          );
+        }
+        humanApproval = await dependencies.walletTransport.dispatchApprovalRequest(
           walletApprovalRequest,
           dependencies.walletApprovalPort
         );
@@ -134,18 +131,55 @@ export async function safeSendXEC(
         ...(humanApproval ? { humanApproval } : {}),
         ...stoppedStages
       });
+
       emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
         intentId: intent.intentId,
         requestId: walletApprovalRequest.requestId,
         policyTraceId: policyDecision.policyTraceId
       });
+
+      if (!humanApproval) {
+        return {
+          status: "needs_human_approval" as const,
+          simulation: true as const,
+          intent,
+          policyDecision,
+          walletApprovalRequest,
+          workflow
+        };
+      }
+
+      if (humanApproval.status === "approved") {
+        return {
+          status: "human_approval_recorded" as const,
+          simulation: true as const,
+          intent,
+          policyDecision,
+          walletApprovalRequest,
+          humanApproval,
+          workflow
+        };
+      }
+
+      if (humanApproval.status === "rejected") {
+        return {
+          status: "rejected" as const,
+          simulation: true as const,
+          intent,
+          policyDecision,
+          walletApprovalRequest,
+          humanApproval,
+          workflow
+        };
+      }
+
       return {
-        status: "needs_human_approval" as const,
+        status: "expired" as const,
         simulation: true as const,
         intent,
         policyDecision,
         walletApprovalRequest,
-        ...(humanApproval ? { humanApproval } : {}),
+        humanApproval,
         workflow
       };
     }
