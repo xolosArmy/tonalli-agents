@@ -41,9 +41,13 @@ import type {
 } from "@xolosarmy/tonalli-core";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const RMZ_WALLET_ROOT = process.env.RMZ_WALLET_ROOT
-  ? path.resolve(process.env.RMZ_WALLET_ROOT)
-  : path.resolve(__dirname, "../../../RMZWallet");
+if (!process.env.RMZ_WALLET_ROOT) {
+  throw new Error(
+    "RMZ_WALLET_ROOT environment variable is required to execute the cross-repo contract harness. " +
+    "Implicit workspace sibling directory fallback is strictly prohibited."
+  );
+}
+const RMZ_WALLET_ROOT = path.resolve(process.env.RMZ_WALLET_ROOT);
 
 async function loadPipelineModules() {
   const encoderUrl = pathToFileURL(

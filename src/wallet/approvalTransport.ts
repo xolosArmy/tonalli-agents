@@ -116,11 +116,22 @@ export interface WalletApprovalAuditDisplay {
   expiresAtIso: string;
 }
 
+export interface WalletApprovalTransport {
+  readonly validateOutboundRequest: (requestInput: unknown) => WalletApprovalRequestV1;
+  readonly formatAuditDisplay: (request: WalletApprovalRequestV1) => WalletApprovalAuditDisplay;
+  readonly dispatchApprovalRequest: (
+    requestInput: unknown,
+    port: WalletApprovalTransportPort
+  ) => Promise<HumanApprovalV1>;
+}
+
 /**
  * Creates an outbound transport client for dispatching canonical WalletApprovalRequestV1
  * envelopes from Agents to Wallet without assuming approval authority.
  */
-export function createWalletApprovalTransport(config: WalletApprovalTransportConfig = {}) {
+export function createWalletApprovalTransport(
+  config: WalletApprovalTransportConfig = {}
+): WalletApprovalTransport {
   const killSwitch = config.killSwitch ?? true;
   const monetaryLimitSats = BigInt(config.monetaryLimitSats ?? 0);
   const getNow = config.nowEpochSeconds ?? (() => Math.floor(Date.now() / 1000));
@@ -370,14 +381,24 @@ export function createWalletApprovalTransport(config: WalletApprovalTransportCon
       );
     }
 
+    if (parsedResponse.status === "approved") {
+      if (!parsedResponse.approver || parsedResponse.approver !== validatedRequest.intent.fromAddress) {
+        rollbackReservation(validatedRequest.requestId);
+        throw new WalletApprovalTransportError(
+          "RESPONSE_BINDING_MISMATCH",
+          `Approved response approver (${parsedResponse.approver ?? "undefined"}) does not match intent fromAddress (${validatedRequest.intent.fromAddress})`
+        );
+      }
+    }
+
     if (
-      parsedResponse.recordedAt > validatedRequest.expiresAt &&
+      parsedResponse.recordedAt >= validatedRequest.expiresAt &&
       parsedResponse.status !== "expired"
     ) {
       rollbackReservation(validatedRequest.requestId);
       throw new WalletApprovalTransportError(
         "RESPONSE_EXPIRED_MISMATCH",
-        `Wallet response recorded after request expiry (${validatedRequest.expiresAt}) must have status 'expired', got '${parsedResponse.status}'`
+        `Wallet response recorded at or after request expiry (${validatedRequest.expiresAt}) must have status 'expired', got '${parsedResponse.status}'`
       );
     }
 
@@ -388,11 +409,6 @@ export function createWalletApprovalTransport(config: WalletApprovalTransportCon
   return {
     validateOutboundRequest,
     formatAuditDisplay,
-    dispatchApprovalRequest,
-    _internal: {
-      getPendingCount: () => pendingReservations.size,
-      getCommittedCount: () => committedRequestIds.size,
-      rollbackReservation
-    }
+    dispatchApprovalRequest
   };
 }

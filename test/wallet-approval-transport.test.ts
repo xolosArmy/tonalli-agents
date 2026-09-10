@@ -142,7 +142,7 @@ test("WalletApprovalTransport canonical flow: validate outbound, format display,
         intentId: req.intent.intentId,
         decisionId: req.policyDecision.decisionId,
         status: "approved",
-        approver: "human-custodian-primary",
+        approver: req.intent.fromAddress,
         recordedAt: 1770000020
       };
     }
@@ -152,10 +152,10 @@ test("WalletApprovalTransport canonical flow: validate outbound, format display,
   assert.equal(humanApproval.kind, "human_approval");
   assert.equal(humanApproval.status, "approved");
   assert.equal(humanApproval.approvalId, "appr-wallet-001");
-  assert.equal(transport._internal.getCommittedCount(), 1);
+  assert.equal(humanApproval.approver, request.intent.fromAddress);
 });
 
-test("WalletApprovalTransport negative: Wallet response with mismatched requestId is rejected", async () => {
+test("WalletApprovalTransport negative: Wallet response with mismatched requestId is rejected and reservation rolled back", async () => {
   const transport = createWalletApprovalTransport({
     killSwitch: false,
     monetaryLimitSats: 1000,
@@ -173,7 +173,7 @@ test("WalletApprovalTransport negative: Wallet response with mismatched requestI
         intentId: req.intent.intentId,
         decisionId: req.policyDecision.decisionId,
         status: "approved",
-        approver: "human-custodian",
+        approver: req.intent.fromAddress,
         recordedAt: 1770000020
       };
     }
@@ -187,11 +187,28 @@ test("WalletApprovalTransport negative: Wallet response with mismatched requestI
       return true;
     }
   );
-  // Reservation should have been rolled back
-  assert.equal(transport._internal.getPendingCount(), 0);
+
+  // Black-box: failure rolled back reservation, so retrying same request succeeds
+  const mockValidPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-wallet-valid",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: 1770000020
+      };
+    }
+  };
+  const recovered = await transport.dispatchApprovalRequest(request, mockValidPort);
+  assert.equal(recovered.status, "approved");
 });
 
-test("WalletApprovalTransport negative: Wallet response recorded after expiry without expired status is rejected", async () => {
+test("WalletApprovalTransport negative: approved response with mismatched approver is rejected", async () => {
   const transport = createWalletApprovalTransport({
     killSwitch: false,
     monetaryLimitSats: 1000,
@@ -199,34 +216,115 @@ test("WalletApprovalTransport negative: Wallet response recorded after expiry wi
   });
   const request = createValidRequest();
 
-  const mockLatePort: WalletApprovalTransportPort = {
+  const mockWrongApproverPort: WalletApprovalTransportPort = {
     async sendApprovalRequest(req) {
       return {
         contractVersion: AGENTIC_CONTRACT_VERSION,
         kind: "human_approval",
-        approvalId: "appr-wallet-001",
+        approvalId: "appr-wallet-wrong-approver",
         requestId: req.requestId,
         intentId: req.intent.intentId,
         decisionId: req.policyDecision.decisionId,
         status: "approved",
-        approver: "human-custodian",
-        recordedAt: 1770000999 // well past expiresAt (1770000300)
+        approver: "ecash:qp3wjpa3tjlj042z2wv7hahvd8whzgcwvue2swknmw", // wrong address
+        recordedAt: 1770000020
       };
     }
   };
 
   await assert.rejects(
-    async () => transport.dispatchApprovalRequest(request, mockLatePort),
+    async () => transport.dispatchApprovalRequest(request, mockWrongApproverPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "RESPONSE_BINDING_MISMATCH");
+      assert.match(err.message, /does not match intent fromAddress/);
+      return true;
+    }
+  );
+});
+
+test("WalletApprovalTransport negative: response recorded at or after expiresAt without expired status is rejected", async () => {
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1000,
+    nowEpochSeconds: () => 1770000010
+  });
+  const request = createValidRequest(); // expiresAt: 1770000300
+
+  // Case 1: recordedAt === expiresAt exactly
+  const mockBoundaryPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-wallet-boundary",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: 1770000300 // exactly at expiresAt
+      };
+    }
+  };
+
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(request, mockBoundaryPort),
     (err: unknown) => {
       assert.ok(err instanceof WalletApprovalTransportError);
       assert.equal(err.code, "RESPONSE_EXPIRED_MISMATCH");
       return true;
     }
   );
-  assert.equal(transport._internal.getPendingCount(), 0);
+
+  // Case 2: recordedAt > expiresAt for rejected status
+  const request2 = createValidRequest({ requestId: "req-sec-test-002" });
+  const mockLateRejectedPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-wallet-late-reject",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "rejected",
+        recordedAt: 1770000350 // after expiresAt
+      };
+    }
+  };
+
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(request2, mockLateRejectedPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "RESPONSE_EXPIRED_MISMATCH");
+      return true;
+    }
+  );
+
+  // Case 3: status === "expired" with recordedAt >= expiresAt succeeds
+  const request3 = createValidRequest({ requestId: "req-sec-test-003" });
+  const mockValidExpiredPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-wallet-valid-expire",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: 1770000305
+      };
+    }
+  };
+
+  const expiredReceipt = await transport.dispatchApprovalRequest(request3, mockValidExpiredPort);
+  assert.equal(expiredReceipt.status, "expired");
 });
 
-test("WalletApprovalTransport port failure triggers reservation rollback", async () => {
+test("WalletApprovalTransport black-box: port failure releases reservation allowing retry", async () => {
   const transport = createWalletApprovalTransport({
     killSwitch: false,
     monetaryLimitSats: 1000,
@@ -248,11 +346,30 @@ test("WalletApprovalTransport port failure triggers reservation rollback", async
       return true;
     }
   );
-  // Reservation rolled back: can attempt again
-  assert.equal(transport._internal.getPendingCount(), 0);
+
+  // Black-box verification: reservation was rolled back, so retrying the exact same
+  // request with a functioning port succeeds without REPLAY_DETECTED.
+  const functioningPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-wallet-retry",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: 1770000020
+      };
+    }
+  };
+
+  const receipt = await transport.dispatchApprovalRequest(request, functioningPort);
+  assert.equal(receipt.status, "approved");
 });
 
-test("WalletApprovalTransport negative: process-local replay rejection", async () => {
+test("WalletApprovalTransport black-box: valid response commits reservation, repeat dispatch fails closed", async () => {
   const transport = createWalletApprovalTransport({
     killSwitch: false,
     monetaryLimitSats: 1000,
@@ -265,7 +382,7 @@ test("WalletApprovalTransport negative: process-local replay rejection", async (
       return {
         contractVersion: AGENTIC_CONTRACT_VERSION,
         kind: "human_approval",
-        approvalId: "appr-wallet-001",
+        approvalId: "appr-wallet-commit",
         requestId: req.requestId,
         intentId: req.intent.intentId,
         decisionId: req.policyDecision.decisionId,
@@ -277,7 +394,7 @@ test("WalletApprovalTransport negative: process-local replay rejection", async (
 
   await transport.dispatchApprovalRequest(request, mockPort);
 
-  // Attempt to replay the same request in the same process
+  // Black-box: repeat dispatch of committed request must fail closed
   await assert.rejects(
     async () => transport.dispatchApprovalRequest(request, mockPort),
     (err: unknown) => {
@@ -286,6 +403,53 @@ test("WalletApprovalTransport negative: process-local replay rejection", async (
       return true;
     }
   );
+});
+
+test("WalletApprovalTransport black-box: pending duplicate dispatch fails closed", async () => {
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1000,
+    nowEpochSeconds: () => 1770000010
+  });
+  const request = createValidRequest();
+
+  let finishDispatch!: (receipt: HumanApprovalV1) => void;
+  const slowPort: WalletApprovalTransportPort = {
+    sendApprovalRequest(req) {
+      return new Promise((resolve) => {
+        finishDispatch = (receipt) => resolve(receipt);
+      });
+    }
+  };
+
+  // Start in-flight dispatch
+  const inFlightPromise = transport.dispatchApprovalRequest(request, slowPort);
+
+  // Duplicate while in-flight must fail closed with REPLAY_DETECTED
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(request, slowPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "REPLAY_DETECTED");
+      return true;
+    }
+  );
+
+  // Finish first dispatch
+  finishDispatch({
+    contractVersion: AGENTIC_CONTRACT_VERSION,
+    kind: "human_approval",
+    approvalId: "appr-slow-001",
+    requestId: request.requestId,
+    intentId: request.intent.intentId,
+    decisionId: request.policyDecision.decisionId,
+    status: "approved",
+    approver: request.intent.fromAddress,
+    recordedAt: 1770000020
+  });
+
+  const receipt = await inFlightPromise;
+  assert.equal(receipt.status, "approved");
 });
 
 test("WalletApprovalTransport negative: policy decision tampering and expiration", () => {
