@@ -153,6 +153,14 @@ export interface WalletApprovalTransportConfig {
    * Explicit flag indicating in-memory development or simulation mode.
    */
   simulationMode?: boolean;
+  /**
+   * Alias for simulationMode.
+   */
+  isSimulation?: boolean;
+  /**
+   * Heartbeat renewal interval in milliseconds while awaiting human approval.
+   */
+  heartbeatIntervalMs?: number;
 }
 
 export interface WalletApprovalAuditDisplay {
@@ -199,24 +207,50 @@ export function createWalletApprovalTransport(
   config: WalletApprovalTransportConfig = {}
 ): WalletApprovalTransport {
   const killSwitch = config.killSwitch ?? true;
-  const monetaryLimitSats = config.monetaryLimitSats !== undefined
+
+  // P1-2: monetaryLimitSats and dailyLimitSats resolution:
+  // effectivePerRequestLimit = monetaryLimitSats ?? dailyLimitSats ?? 0
+  // effectiveDailyLimit = dailyLimitSats ?? monetaryLimitSats ?? 0
+  const effectivePerRequestLimit = config.monetaryLimitSats !== undefined
     ? BigInt(config.monetaryLimitSats)
     : config.dailyLimitSats !== undefined
       ? BigInt(config.dailyLimitSats)
       : 0n;
-  const dailyLimitSats = config.dailyLimitSats !== undefined
+
+  const effectiveDailyLimit = config.dailyLimitSats !== undefined
     ? BigInt(config.dailyLimitSats)
-    : undefined;
+    : config.monetaryLimitSats !== undefined
+      ? BigInt(config.monetaryLimitSats)
+      : 0n;
+
   const getNow = config.nowEpochSeconds ?? (() => Math.floor(Date.now() / 1000));
   const ownerId = config.ownerId ?? `worker-${randomUUID()}`;
   const leaseDurationSeconds = config.leaseDurationSeconds ?? 60;
+  const heartbeatIntervalMs = config.heartbeatIntervalMs;
+
+  const isSimulation =
+    config.simulationMode === true ||
+    (config as any).isSimulation === true ||
+    process.env.TONALLI_SIMULATION === "true";
+
+  // Fail-closed in-memory fallback audit:
+  // If neither durableStore nor persistent dbPath is supplied:
+  // fail closed unless simulationMode === true.
+  if (!config.durableStore && (!config.dbPath || config.dbPath === ":memory:")) {
+    if (!isSimulation) {
+      throw new WalletApprovalTransportError(
+        "STORE_UNAVAILABLE",
+        "A persistent dbPath or authoritative durableStore instance is required. In-memory storage (:memory:) is strictly prohibited unless simulationMode: true is explicitly configured."
+      );
+    }
+  }
 
   // Authoritative durable state store: SQLite reference adapter by default
   const durableStore: DurableAuthorizationStore =
     config.durableStore ??
     createSqliteDurableStore({
       dbPath: config.dbPath ?? ":memory:",
-      isSimulation: !config.dbPath
+      isSimulation
     });
 
   function getValidNowEpochSeconds(): number {
@@ -302,16 +336,16 @@ export function createWalletApprovalTransport(
     }
 
     const intentSats = BigInt(parsed.intent.amountSats);
-    if (intentSats > monetaryLimitSats) {
+    if (intentSats > effectivePerRequestLimit) {
       throw new WalletApprovalTransportError(
         "MONETARY_LIMIT_EXCEEDED",
-        `Requested amount (${parsed.intent.amountSats} sats) exceeds agent monetary limit (${monetaryLimitSats} sats)`
+        `Requested amount (${parsed.intent.amountSats} sats) exceeds agent monetary limit (${effectivePerRequestLimit} sats)`
       );
     }
-    if (dailyLimitSats !== undefined && intentSats > dailyLimitSats) {
+    if (intentSats > effectiveDailyLimit) {
       throw new WalletApprovalTransportError(
         "MONETARY_LIMIT_EXCEEDED",
-        `Requested amount (${parsed.intent.amountSats} sats) exceeds agent daily limit (${dailyLimitSats} sats)`
+        `Requested amount (${parsed.intent.amountSats} sats) exceeds agent daily limit (${effectiveDailyLimit} sats)`
       );
     }
 
@@ -392,7 +426,7 @@ export function createWalletApprovalTransport(
         identifiers: replayIdentifiers,
         spending: spendingIdentity,
         amountSats: BigInt(validatedRequest.intent.amountSats),
-        ...(dailyLimitSats !== undefined ? { dailyLimitSats } : {}),
+        dailyLimitSats: effectiveDailyLimit,
         requestRequestedAt: validatedRequest.requestedAt,
         requestExpiresAt: validatedRequest.expiresAt,
         nowEpochSeconds: now,
@@ -435,6 +469,8 @@ export function createWalletApprovalTransport(
       );
     }
 
+    let currentHandle = reservationHandle;
+
     // Helper to safely roll back and fail closed
     const rollbackAndFail = async (
       code: WalletApprovalTransportErrorCode,
@@ -443,8 +479,9 @@ export function createWalletApprovalTransport(
     ): Promise<never> => {
       try {
         await durableStore.rollbackAuthorization({
-          reservationId: reservationHandle.reservationId,
-          leaseToken: reservationHandle.leaseToken,
+          reservationId: currentHandle.reservationId,
+          leaseToken: currentHandle.leaseToken,
+          fencingToken: currentHandle.fencingToken,
           nowEpochSeconds: getValidNowEpochSeconds(),
           reason: code
         });
@@ -454,15 +491,77 @@ export function createWalletApprovalTransport(
       throw new WalletApprovalTransportError(code, message, details);
     };
 
+    // Canonical workflow boundary: human review and lease renewal cannot extend beyond this
+    const canonicalWorkflowExpiry = Math.min(
+      validatedRequest.expiresAt,
+      validatedRequest.intent.expiresAt,
+      validatedRequest.policyDecision.expiresAt
+    );
+
+    // Heartbeat lease renewal while awaiting Wallet port response
+    // Bounds renewal to canonical workflow validity window
+    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    let heartbeatStopped = false;
+
+    const stopHeartbeat = () => {
+      heartbeatStopped = true;
+      if (heartbeatTimer !== null) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+    };
+
+    const intervalMs = heartbeatIntervalMs ?? Math.max(500, Math.floor((leaseDurationSeconds * 1000) / 2));
+
+    const renewLeaseHeartbeat = async () => {
+      if (heartbeatStopped) return;
+      const currentNow = getValidNowEpochSeconds();
+      if (currentNow >= canonicalWorkflowExpiry) {
+        stopHeartbeat();
+        return;
+      }
+
+      const remainingWorkflowSeconds = canonicalWorkflowExpiry - currentNow;
+      const additionalSeconds = Math.min(leaseDurationSeconds, remainingWorkflowSeconds);
+      if (additionalSeconds <= 0) {
+        stopHeartbeat();
+        return;
+      }
+
+      try {
+        if (typeof durableStore.renewLease === "function") {
+          const renewed = await durableStore.renewLease({
+            reservationId: currentHandle.reservationId,
+            leaseToken: currentHandle.leaseToken,
+            fencingToken: currentHandle.fencingToken,
+            additionalSeconds,
+            nowEpochSeconds: currentNow
+          });
+          currentHandle = renewed;
+        }
+      } catch {
+        // If renewal fails (e.g. lease superseded or expired), stop further heartbeat
+        stopHeartbeat();
+      }
+    };
+
+    heartbeatTimer = setInterval(() => {
+      void renewLeaseHeartbeat();
+    }, intervalMs);
+    heartbeatTimer.unref();
+
     let walletResponse: unknown;
     try {
       walletResponse = await port.sendApprovalRequest(validatedRequest);
     } catch (err) {
+      stopHeartbeat();
       return rollbackAndFail(
         "PORT_DISPATCH_FAILED",
         `Wallet transport port failed to dispatch request: ${err instanceof Error ? err.message : String(err)}`,
         err
       );
+    } finally {
+      stopHeartbeat();
     }
 
     let parsedResponse: HumanApprovalV1;
@@ -520,11 +619,6 @@ export function createWalletApprovalTransport(
       }
     }
 
-    const canonicalWorkflowExpiry = Math.min(
-      validatedRequest.intent.expiresAt,
-      validatedRequest.policyDecision.expiresAt
-    );
-
     if (
       parsedResponse.recordedAt >= validatedRequest.intent.expiresAt ||
       parsedResponse.recordedAt >= validatedRequest.policyDecision.expiresAt
@@ -550,8 +644,9 @@ export function createWalletApprovalTransport(
     // If rejected/expired: locks replay identity to prevent re-dispatch while releasing budget.
     try {
       await durableStore.commitAuthorization({
-        reservationId: reservationHandle.reservationId,
-        leaseToken: reservationHandle.leaseToken,
+        reservationId: currentHandle.reservationId,
+        leaseToken: currentHandle.leaseToken,
+        fencingToken: currentHandle.fencingToken,
         nowEpochSeconds: getValidNowEpochSeconds(),
         approvalStatus: parsedResponse.status
       });

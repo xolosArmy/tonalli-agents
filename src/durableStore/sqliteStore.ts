@@ -61,6 +61,16 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
   private isClosed: boolean = false;
 
   constructor(config: SqliteStoreConfig = {}) {
+    const isExplicitSimulation = config.isSimulation === true;
+    const isMemoryPath = !config.dbPath || config.dbPath === ":memory:";
+
+    if (isMemoryPath && !isExplicitSimulation) {
+      throw new DurableStoreError(
+        "STORE_UNAVAILABLE",
+        "In-memory SQLite storage (:memory:) is strictly prohibited in production. Explicit isSimulation: true is required."
+      );
+    }
+
     this.dbPath = config.dbPath ?? ":memory:";
     this.busyTimeoutMs = config.busyTimeoutMs ?? 5000;
     this.defaultLeaseDurationSeconds = config.defaultLeaseDurationSeconds ?? 60;
@@ -69,6 +79,7 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
       this.db = new DatabaseSync(this.dbPath);
       this.initializeDatabase();
     } catch (err) {
+      if (err instanceof DurableStoreError) throw err;
       throw new DurableStoreError(
         "STORE_UNAVAILABLE",
         `Failed to initialize SQLite authorization store at '${this.dbPath}': ${err instanceof Error ? err.message : String(err)}`,
@@ -138,6 +149,21 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
 
         CREATE INDEX IF NOT EXISTS idx_res_expiry
           ON authorization_reservations(state, request_expires_at);
+
+        CREATE TABLE IF NOT EXISTS authorization_daily_spending (
+          spending_key TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          from_address TEXT NOT NULL,
+          network TEXT NOT NULL,
+          utc_date TEXT NOT NULL,
+          committed_sats TEXT NOT NULL,
+          day_end_epoch INTEGER NOT NULL,
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_daily_spending_prune
+          ON authorization_daily_spending(day_end_epoch);
       `);
     } catch (err) {
       throw new DurableStoreError(
@@ -254,17 +280,32 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
       // Key binds: agentId, fromAddress, network, and utcDate
       if (input.dailyLimitSats !== undefined) {
         const dailyLimitSats = BigInt(input.dailyLimitSats);
-        const activeRows = this.db.prepare(`
+        const spendingKey = formatSpendingKey(
+          input.spending.agentId,
+          input.spending.fromAddress,
+          input.spending.network,
+          utcDate
+        );
+
+        // Committed spending is durably preserved in authorization_daily_spending through end of UTC day
+        const committedRow = this.db.prepare(`
+          SELECT committed_sats
+          FROM authorization_daily_spending
+          WHERE spending_key = ?;
+        `).get(spendingKey) as { committed_sats: string } | undefined;
+
+        const currentCommittedSats = committedRow ? BigInt(committedRow.committed_sats) : 0n;
+
+        // Pending reservations currently active and unexpired
+        const pendingRows = this.db.prepare(`
           SELECT amount_sats
           FROM authorization_reservations
           WHERE agent_id = ?
             AND from_address = ?
             AND network = ?
             AND utc_date = ?
-            AND (
-              (state = 'COMMITTED' AND (approval_status = 'approved' OR approval_status IS NULL)) OR
-              (state = 'PENDING' AND lease_expires_at > ?)
-            );
+            AND state = 'PENDING'
+            AND lease_expires_at > ?;
         `).all(
           input.spending.agentId,
           input.spending.fromAddress,
@@ -273,20 +314,15 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
           now
         ) as Array<{ amount_sats: string }>;
 
-        let currentDailyTotal = 0n;
-        for (const row of activeRows) {
-          currentDailyTotal += BigInt(row.amount_sats);
+        let currentPendingTotal = 0n;
+        for (const row of pendingRows) {
+          currentPendingTotal += BigInt(row.amount_sats);
         }
 
-        if (currentDailyTotal + amountSats > dailyLimitSats) {
+        if (currentCommittedSats + currentPendingTotal + amountSats > dailyLimitSats) {
           throw new DurableStoreError(
             "MONETARY_LIMIT_EXCEEDED",
-            `Cumulative daily authorization limit exceeded for spending key '${formatSpendingKey(
-              input.spending.agentId,
-              input.spending.fromAddress,
-              input.spending.network,
-              utcDate
-            )}': current active=${currentDailyTotal} sats, requested=${amountSats} sats, dailyLimit=${dailyLimitSats} sats`
+            `Cumulative daily authorization limit exceeded for spending key '${spendingKey}': current committed=${currentCommittedSats} sats, active reserved=${currentPendingTotal} sats, requested=${amountSats} sats, dailyLimit=${dailyLimitSats} sats`
           );
         }
       }
@@ -388,7 +424,7 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
 
     try {
       const record = this.db.prepare(`
-        SELECT reservation_id, state, lease_token, fencing_token, lease_expires_at
+        SELECT *
         FROM authorization_reservations
         WHERE reservation_id = ?;
       `).get(input.reservationId) as Record<string, any> | undefined;
@@ -402,6 +438,12 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
 
       if (record.state === "COMMITTED") {
         if (record.lease_token === input.leaseToken) {
+          if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
+            throw new DurableStoreError(
+              "LEASE_SUPERSEDED",
+              `Commit rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
+            );
+          }
           // Idempotent commit by the same valid owner
           this.db.exec("COMMIT;");
           return;
@@ -440,6 +482,13 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
         );
       }
 
+      if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
+        throw new DurableStoreError(
+          "LEASE_SUPERSEDED",
+          `Commit rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
+        );
+      }
+
       if (now >= record.lease_expires_at) {
         // Lease has expired before commit could be recorded
         this.db.prepare(`
@@ -461,6 +510,44 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
           SET state = 'COMMITTED', approval_status = 'approved', updated_at = ?
           WHERE reservation_id = ?;
         `).run(now, input.reservationId);
+
+        const dayEndEpoch = Math.floor(Date.parse(record.utc_date + "T00:00:00.000Z") / 1000) + 86400;
+        const spendingKey = formatSpendingKey(
+          record.agent_id,
+          record.from_address,
+          record.network,
+          record.utc_date
+        );
+
+        const existingDaily = this.db.prepare(`
+          SELECT committed_sats FROM authorization_daily_spending WHERE spending_key = ?;
+        `).get(spendingKey) as { committed_sats: string } | undefined;
+
+        if (existingDaily) {
+          const newCommitted = (BigInt(existingDaily.committed_sats) + BigInt(record.amount_sats)).toString();
+          this.db.prepare(`
+            UPDATE authorization_daily_spending
+            SET committed_sats = ?, updated_at = ?
+            WHERE spending_key = ?;
+          `).run(newCommitted, now, spendingKey);
+        } else {
+          this.db.prepare(`
+            INSERT INTO authorization_daily_spending (
+              spending_key, agent_id, from_address, network, utc_date,
+              committed_sats, day_end_epoch, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+          `).run(
+            spendingKey,
+            record.agent_id,
+            record.from_address,
+            record.network,
+            record.utc_date,
+            record.amount_sats,
+            dayEndEpoch,
+            now,
+            now
+          );
+        }
       } else {
         // Human rejected or expired: commit replay protection, release budget
         this.db.prepare(`
@@ -497,7 +584,7 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
 
     try {
       const record = this.db.prepare(`
-        SELECT reservation_id, state, lease_token
+        SELECT reservation_id, state, lease_token, fencing_token
         FROM authorization_reservations
         WHERE reservation_id = ?;
       `).get(input.reservationId) as Record<string, any> | undefined;
@@ -510,6 +597,12 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
       }
 
       if (record.state === "ROLLED_BACK") {
+        if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
+          throw new DurableStoreError(
+            "LEASE_SUPERSEDED",
+            `Rollback rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
+          );
+        }
         // Idempotent rollback
         this.db.exec("COMMIT;");
         return;
@@ -533,6 +626,13 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
           throw new DurableStoreError(
             "LEASE_SUPERSEDED",
             `Rollback rejected: lease token mismatch for reservation '${input.reservationId}'`
+          );
+        }
+
+        if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
+          throw new DurableStoreError(
+            "LEASE_SUPERSEDED",
+            `Rollback rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
           );
         }
 
@@ -591,6 +691,13 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
 
       if (record.lease_token !== input.leaseToken) {
         throw new DurableStoreError("LEASE_SUPERSEDED", `Lease token mismatch on renewal for '${input.reservationId}'`);
+      }
+
+      if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
+        throw new DurableStoreError(
+          "LEASE_SUPERSEDED",
+          `Renewal rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
+        );
       }
 
       if (now >= record.lease_expires_at) {
@@ -672,10 +779,10 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
   /**
    * Transactionally prunes expired records whose canonical validity window has elapsed.
    */
-  pruneExpired(input: PruneExpiredInput): number {
+  pruneExpired(input: PruneExpiredInput | number): number {
     this.ensureOpen();
-    const now = input.nowEpochSeconds;
-    const retentionSeconds = input.retentionSeconds ?? 86400; // 24 hour retention for terminal records
+    const now = typeof input === "number" ? input : input.nowEpochSeconds;
+    const retentionSeconds = typeof input === "number" ? 86400 : (input.retentionSeconds ?? 86400); // 24 hour retention for terminal records
     const terminalRetentionCutoff = now - retentionSeconds;
 
     try {
@@ -690,6 +797,11 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
         WHERE (state = 'COMMITTED' AND request_expires_at <= ?)
            OR (state IN ('ROLLED_BACK', 'EXPIRED') AND updated_at <= ?);
       `).run(now, terminalRetentionCutoff);
+
+      this.db.prepare(`
+        DELETE FROM authorization_daily_spending
+        WHERE day_end_epoch <= ?;
+      `).run(terminalRetentionCutoff);
 
       this.db.exec("COMMIT;");
       return Number(result.changes);
@@ -711,35 +823,35 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
   ): DailySpendingStats {
     this.ensureOpen();
 
-    const rows = this.db.prepare(`
-      SELECT amount_sats, state, lease_expires_at
+    const spendingKey = formatSpendingKey(spending.agentId, spending.fromAddress, spending.network, utcDate);
+    const committedRow = this.db.prepare(`
+      SELECT committed_sats
+      FROM authorization_daily_spending
+      WHERE spending_key = ?;
+    `).get(spendingKey) as { committed_sats: string } | undefined;
+
+    const committedSats = committedRow ? BigInt(committedRow.committed_sats) : 0n;
+
+    const pendingRows = this.db.prepare(`
+      SELECT amount_sats
       FROM authorization_reservations
       WHERE agent_id = ?
         AND from_address = ?
         AND network = ?
         AND utc_date = ?
-        AND (
-          (state = 'COMMITTED' AND (approval_status = 'approved' OR approval_status IS NULL)) OR
-          (state = 'PENDING' AND lease_expires_at > ?)
-        );
+        AND state = 'PENDING'
+        AND lease_expires_at > ?;
     `).all(
       spending.agentId,
       spending.fromAddress,
       spending.network,
       utcDate,
       nowEpochSeconds
-    ) as Array<{ amount_sats: string; state: string; lease_expires_at: number }>;
+    ) as Array<{ amount_sats: string }>;
 
-    let committedSats = 0n;
     let reservedSats = 0n;
-
-    for (const row of rows) {
-      const amount = BigInt(row.amount_sats);
-      if (row.state === "COMMITTED") {
-        committedSats += amount;
-      } else if (row.state === "PENDING" && row.lease_expires_at > nowEpochSeconds) {
-        reservedSats += amount;
-      }
+    for (const row of pendingRows) {
+      reservedSats += BigInt(row.amount_sats);
     }
 
     return {

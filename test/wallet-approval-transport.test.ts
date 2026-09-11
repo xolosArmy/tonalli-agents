@@ -6,11 +6,19 @@ import {
   type WalletApprovalRequestV1
 } from "@xolosarmy/tonalli-core";
 import {
-  createWalletApprovalTransport,
+  createWalletApprovalTransport as rawCreateWalletApprovalTransport,
   WalletApprovalTransportError,
-  type WalletApprovalTransportPort
+  type WalletApprovalTransportPort,
+  type WalletApprovalTransportConfig
 } from "../src/wallet/approvalTransport";
 import { formatSatsToExactXEC } from "../src/wallet/format";
+
+function createWalletApprovalTransport(config: WalletApprovalTransportConfig = {}) {
+  return rawCreateWalletApprovalTransport({
+    simulationMode: true,
+    ...config
+  });
+}
 
 const BASE_VALID_INTENT = {
   contractVersion: AGENTIC_CONTRACT_VERSION,
@@ -822,7 +830,8 @@ test("WalletApprovalTransport P2-3: Dispatch failure rolls back pending reservat
 test("WalletApprovalTransport Gate 2A P2: canonical workflow window boundary enforcement", async () => {
   const transport = createWalletApprovalTransport({
     killSwitch: false,
-    monetaryLimitSats: 1000,
+    monetaryLimitSats: 10000,
+    dailyLimitSats: 50000,
     nowEpochSeconds: () => 1770000010
   });
 

@@ -992,7 +992,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
   });
   // 20. DB unavailable → fail closed
   await t.test("Scenario 20: DB unavailable fails closed with STORE_UNAVAILABLE", async () => {
-    const store = createSqliteDurableStore({ dbPath: ":memory:" });
+    const store = createSqliteDurableStore({ dbPath: ":memory:", isSimulation: true });
     store.close();
 
     assert.throws(
@@ -1187,5 +1187,454 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     assert.equal(statsAfterAbort.pending, statsAfterFirst.pending);
 
     store.close();
+  });
+
+  // 23. P1-1 Regression: Daily budget survives pruning of expired requests
+  await t.test("Scenario 23: P1-1 daily budget survives pruning of expired requests", () => {
+    const store = createSqliteDurableStore({ dbPath: dbFile });
+    const spending = {
+      agentId: "agent-p1-1",
+      fromAddress: FROM_ADDRESS,
+      network: "xec:mainnet" as const
+    };
+
+    const dayStartEpoch = 1770000000; // 2026-02-02
+    const reqExpiresAt = dayStartEpoch + 300; // 5 minutes later
+
+    // Reserve 80 sats under 100 limit
+    const handle1 = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-p1-1-${randomUUID()}`,
+        intentId: `intent-p1-1-${randomUUID()}`,
+        intentNonce: `nonce-p1-1-${randomUUID()}`
+      },
+      spending,
+      amountSats: 80n,
+      dailyLimitSats: 100n,
+      requestRequestedAt: dayStartEpoch,
+      requestExpiresAt: reqExpiresAt,
+      nowEpochSeconds: dayStartEpoch + 10,
+      ownerId: "worker-p1-1"
+    });
+
+    // Commit approval of 80 sats
+    store.commitAuthorization({
+      reservationId: handle1.reservationId,
+      leaseToken: handle1.leaseToken,
+      approvalStatus: "approved",
+      nowEpochSeconds: dayStartEpoch + 20
+    });
+
+    // Time advances past request expiration (5 minutes later)
+    const afterExpiry = reqExpiresAt + 50;
+
+    // Run pruning: expired request row should be purged
+    const pruned = store.pruneExpired(afterExpiry);
+    assert.ok(pruned >= 1);
+
+    // Attempt to authorize another 30 sats on the SAME UTC day:
+    // real authorized that day is already 80. 80 + 30 = 110 > 100 limit.
+    // MUST FAIL closed with MONETARY_LIMIT_EXCEEDED!
+    assert.throws(
+      () =>
+        store.reserveAuthorization({
+          identifiers: {
+            requestId: `req-p1-1-subsequent-${randomUUID()}`,
+            intentId: `intent-p1-1-subsequent-${randomUUID()}`,
+            intentNonce: `nonce-p1-1-subsequent-${randomUUID()}`
+          },
+          spending,
+          amountSats: 30n,
+          dailyLimitSats: 100n,
+          requestRequestedAt: afterExpiry,
+          requestExpiresAt: afterExpiry + 300,
+          nowEpochSeconds: afterExpiry,
+          ownerId: "worker-p1-1"
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "MONETARY_LIMIT_EXCEEDED");
+        return true;
+      }
+    );
+
+    // However, 20 sats still fits within the 100 limit (80 + 20 = 100)
+    const handleFit = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-p1-1-fit-${randomUUID()}`,
+        intentId: `intent-p1-1-fit-${randomUUID()}`,
+        intentNonce: `nonce-p1-1-fit-${randomUUID()}`
+      },
+      spending,
+      amountSats: 20n,
+      dailyLimitSats: 100n,
+      requestRequestedAt: afterExpiry,
+      requestExpiresAt: afterExpiry + 300,
+      nowEpochSeconds: afterExpiry,
+      ownerId: "worker-p1-1"
+    });
+    assert.ok(handleFit.reservationId);
+
+    // Now advance clock past UTC midnight (next day: 2026-02-03)
+    const nextDayEpoch = 1770000000 + 86400 + 100; // next day
+    const nextDayHandle = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-p1-1-nextday-${randomUUID()}`,
+        intentId: `intent-p1-1-nextday-${randomUUID()}`,
+        intentNonce: `nonce-p1-1-nextday-${randomUUID()}`
+      },
+      spending,
+      amountSats: 80n,
+      dailyLimitSats: 100n,
+      requestRequestedAt: nextDayEpoch,
+      requestExpiresAt: nextDayEpoch + 300,
+      nowEpochSeconds: nextDayEpoch,
+      ownerId: "worker-p1-1"
+    });
+    assert.ok(nextDayHandle.reservationId);
+
+    store.close();
+  });
+
+  // 24. P1-2 Regression: monetaryLimitSats becomes effective cumulative daily limit
+  await t.test("Scenario 24: P1-2 monetaryLimitSats establishes cumulative daily ceiling", async () => {
+    let clock = 1770000010;
+    const transport = createWalletApprovalTransport({
+      killSwitch: false,
+      monetaryLimitSats: 100, // No dailyLimitSats passed!
+      simulationMode: true,
+      nowEpochSeconds: () => clock
+    });
+
+    const mockPort: WalletApprovalTransportPort = {
+      async sendApprovalRequest(req) {
+        return {
+          contractVersion: AGENTIC_CONTRACT_VERSION,
+          kind: "human_approval",
+          approvalId: `appr-${randomUUID()}`,
+          requestId: req.requestId,
+          intentId: req.intent.intentId,
+          decisionId: req.policyDecision.decisionId,
+          status: "approved",
+          approver: req.intent.fromAddress,
+          recordedAt: clock
+        };
+      }
+    };
+
+    // First request: 60 sats under 100 limit succeeds
+    const req1 = {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "wallet_approval_request" as const,
+      purpose: "xec_payment" as const,
+      requestId: `req-lim-1-${randomUUID()}`,
+      intent: {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "agent_intent" as const,
+        intentId: `intent-lim-1-${randomUUID()}`,
+        nonce: `nonce-lim-1-${randomUUID().replace(/-/g, "")}`,
+        agentId: "agent-limit-test",
+        agentRole: "tester",
+        network: "xec:mainnet" as const,
+        fromAddress: FROM_ADDRESS,
+        toAddress: "ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5",
+        amountSats: "60",
+        reason: "First payment",
+        createdAt: clock,
+        expiresAt: clock + 300
+      },
+      policyDecision: {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "cae_policy_decision" as const,
+        decisionId: `cae-lim-1-${randomUUID()}`,
+        intentId: `intent-lim-1`,
+        decision: "needs_human_approval" as const,
+        reasonCode: "CONFIRMATION_REQUIRED",
+        reason: "Test",
+        policyTraceId: "trace-1",
+        policyVersion: "1.0",
+        evaluatedAt: clock,
+        expiresAt: clock + 300
+      },
+      requestedAt: clock,
+      expiresAt: clock + 300
+    };
+    req1.policyDecision.intentId = req1.intent.intentId;
+
+    const receipt1 = await transport.dispatchApprovalRequest(req1, mockPort);
+    assert.equal(receipt1.status, "approved");
+
+    // Second request: another 60 sats on the SAME day: 60 + 60 = 120 > 100!
+    // Must be rejected with MONETARY_LIMIT_EXCEEDED!
+    const req2 = {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "wallet_approval_request" as const,
+      purpose: "xec_payment" as const,
+      requestId: `req-lim-2-${randomUUID()}`,
+      intent: {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "agent_intent" as const,
+        intentId: `intent-lim-2-${randomUUID()}`,
+        nonce: `nonce-lim-2-${randomUUID().replace(/-/g, "")}`,
+        agentId: "agent-limit-test",
+        agentRole: "tester",
+        network: "xec:mainnet" as const,
+        fromAddress: FROM_ADDRESS,
+        toAddress: "ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5",
+        amountSats: "60",
+        reason: "Second payment",
+        createdAt: clock,
+        expiresAt: clock + 300
+      },
+      policyDecision: {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "cae_policy_decision" as const,
+        decisionId: `cae-lim-2-${randomUUID()}`,
+        intentId: `intent-lim-2`,
+        decision: "needs_human_approval" as const,
+        reasonCode: "CONFIRMATION_REQUIRED",
+        reason: "Test",
+        policyTraceId: "trace-2",
+        policyVersion: "1.0",
+        evaluatedAt: clock,
+        expiresAt: clock + 300
+      },
+      requestedAt: clock,
+      expiresAt: clock + 300
+    };
+    req2.policyDecision.intentId = req2.intent.intentId;
+
+    await assert.rejects(
+      async () => transport.dispatchApprovalRequest(req2, mockPort),
+      (err: unknown) => {
+        assert.ok(err instanceof WalletApprovalTransportError);
+        assert.equal(err.code, "MONETARY_LIMIT_EXCEEDED");
+        return true;
+      }
+    );
+  });
+
+  // 25. P1-3 Regressions: Lease renewal heartbeat & fencing token enforcement
+  await t.test("Scenario 25: P1-3 heartbeat renewal and fencing token protection", async () => {
+    const store = createSqliteDurableStore({ dbPath: dbFile });
+
+    // 25a: Fencing token increment and rejection of stale generations
+    const initialHandle = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-fence-${randomUUID()}`,
+        intentId: `intent-fence-${randomUUID()}`,
+        intentNonce: `nonce-fence-${randomUUID()}`
+      },
+      spending: BASE_SPENDING,
+      amountSats: 10n,
+      dailyLimitSats: 1000n,
+      requestRequestedAt: 1770000000,
+      requestExpiresAt: 1770000300,
+      nowEpochSeconds: 1770000005,
+      ownerId: "worker-fence",
+      leaseDurationSeconds: 10
+    });
+    assert.equal(initialHandle.fencingToken, 1);
+
+    // Renew lease: fencingToken should increment to 2
+    const renewedHandle = store.renewLease({
+      reservationId: initialHandle.reservationId,
+      leaseToken: initialHandle.leaseToken,
+      fencingToken: initialHandle.fencingToken,
+      additionalSeconds: 15,
+      nowEpochSeconds: 1770000010
+    });
+    assert.equal(renewedHandle.fencingToken, 2);
+
+    // Stale generation 1 attempts to commit: must fail with LEASE_SUPERSEDED
+    assert.throws(
+      () =>
+        store.commitAuthorization({
+          reservationId: initialHandle.reservationId,
+          leaseToken: initialHandle.leaseToken,
+          fencingToken: initialHandle.fencingToken, // stale fencingToken 0
+          approvalStatus: "approved",
+          nowEpochSeconds: 1770000015
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Stale generation 0 attempts to rollback: must fail with LEASE_SUPERSEDED
+    assert.throws(
+      () =>
+        store.rollbackAuthorization({
+          reservationId: initialHandle.reservationId,
+          leaseToken: initialHandle.leaseToken,
+          fencingToken: initialHandle.fencingToken, // stale fencingToken 0
+          reason: "stale rollback",
+          nowEpochSeconds: 1770000015
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Fresh generation 1 commits successfully
+    store.commitAuthorization({
+      reservationId: renewedHandle.reservationId,
+      leaseToken: renewedHandle.leaseToken,
+      fencingToken: renewedHandle.fencingToken, // generation 1
+      approvalStatus: "approved",
+      nowEpochSeconds: 1770000015
+    });
+
+    // 25b: Live heartbeat keeps pending reservation alive past initial lease
+    let currentNow = 1770000000;
+    const heartbeatTransport = createWalletApprovalTransport({
+      killSwitch: false,
+      monetaryLimitSats: 1000,
+      durableStore: store,
+      leaseDurationSeconds: 2, // 2s lease
+      heartbeatIntervalMs: 50, // heartbeat every 50ms extends lease by 2s
+      nowEpochSeconds: () => currentNow
+    });
+
+    // Port that advances time past initial 2s lease during human decision
+    const slowPort: WalletApprovalTransportPort = {
+      async sendApprovalRequest(req) {
+        // Heartbeat tick 1 (at 50ms): renews lease at currentNow
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        // Clock moves forward 1s
+        currentNow += 1;
+        // Heartbeat tick 2 (at 100ms+): renews lease at currentNow + 1
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        // Clock moves forward another 1s (total 2s: would have expired without heartbeats!)
+        currentNow += 1;
+        // Heartbeat tick 3: renews lease at currentNow + 2
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return {
+          contractVersion: AGENTIC_CONTRACT_VERSION,
+          kind: "human_approval",
+          approvalId: `appr-hb-${randomUUID()}`,
+          requestId: req.requestId,
+          intentId: req.intent.intentId,
+          decisionId: req.policyDecision.decisionId,
+          status: "approved",
+          approver: req.intent.fromAddress,
+          recordedAt: currentNow
+        };
+      }
+    };
+
+    const hbRequest = {
+      contractVersion: AGENTIC_CONTRACT_VERSION,
+      kind: "wallet_approval_request" as const,
+      purpose: "xec_payment" as const,
+      requestId: `req-hb-${randomUUID()}`,
+      intent: {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "agent_intent" as const,
+        intentId: `intent-hb-${randomUUID()}`,
+        nonce: `nonce-hb-${randomUUID().replace(/-/g, "")}`,
+        agentId: "agent-hb-test",
+        agentRole: "tester",
+        network: "xec:mainnet" as const,
+        fromAddress: FROM_ADDRESS,
+        toAddress: "ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5",
+        amountSats: "25",
+        reason: "Heartbeat test",
+        createdAt: currentNow,
+        expiresAt: currentNow + 300
+      },
+      policyDecision: {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "cae_policy_decision" as const,
+        decisionId: `cae-hb-${randomUUID()}`,
+        intentId: `intent-hb`,
+        decision: "needs_human_approval" as const,
+        reasonCode: "CONFIRMATION_REQUIRED",
+        reason: "Test",
+        policyTraceId: "trace-hb",
+        policyVersion: "1.0",
+        evaluatedAt: currentNow,
+        expiresAt: currentNow + 300
+      },
+      requestedAt: currentNow,
+      expiresAt: currentNow + 300
+    };
+    hbRequest.policyDecision.intentId = hbRequest.intent.intentId;
+
+    const hbReceipt = await heartbeatTransport.dispatchApprovalRequest(hbRequest, slowPort);
+    assert.equal(hbReceipt.status, "approved");
+
+    store.close();
+  });
+
+  // 26. Fail-closed in-memory fallback audit
+  await t.test("Scenario 26: In-memory fallback fail-closed enforcement", () => {
+    // Save current env and delete TONALLI_SIMULATION for clean test
+    const origEnv = process.env.TONALLI_SIMULATION;
+    delete process.env.TONALLI_SIMULATION;
+
+    try {
+      // 1. Calling createWalletApprovalTransport() without dbPath, durableStore, or simulationMode must throw STORE_UNAVAILABLE
+      assert.throws(
+        () => createWalletApprovalTransport({}),
+        (err: unknown) => {
+          assert.ok(err instanceof WalletApprovalTransportError);
+          assert.equal(err.code, "STORE_UNAVAILABLE");
+          return true;
+        }
+      );
+
+      // 2. Explicit simulationMode: false must throw STORE_UNAVAILABLE
+      assert.throws(
+        () => createWalletApprovalTransport({ simulationMode: false }),
+        (err: unknown) => {
+          assert.ok(err instanceof WalletApprovalTransportError);
+          assert.equal(err.code, "STORE_UNAVAILABLE");
+          return true;
+        }
+      );
+
+      // 3. createSqliteDurableStore without isSimulation: true must throw STORE_UNAVAILABLE
+      assert.throws(
+        () => createSqliteDurableStore({ dbPath: ":memory:" }),
+        (err: unknown) => {
+          assert.ok(err instanceof DurableStoreError);
+          assert.equal(err.code, "STORE_UNAVAILABLE");
+          return true;
+        }
+      );
+
+      // 4. createSqliteDurableStore() with no config must throw STORE_UNAVAILABLE
+      assert.throws(
+        () => createSqliteDurableStore(),
+        (err: unknown) => {
+          assert.ok(err instanceof DurableStoreError);
+          assert.equal(err.code, "STORE_UNAVAILABLE");
+          return true;
+        }
+      );
+
+      // 5. Explicit simulationMode: true succeeds
+      const simTransport = createWalletApprovalTransport({ simulationMode: true });
+      assert.ok(simTransport);
+
+      // 6. Explicit isSimulation: true on store succeeds
+      const simStore = createSqliteDurableStore({ isSimulation: true });
+      assert.ok(simStore);
+      simStore.close();
+
+      // 7. Persistent file dbPath succeeds without simulationMode
+      const fileStore = createSqliteDurableStore({ dbPath: dbFile });
+      assert.ok(fileStore);
+      fileStore.close();
+    } finally {
+      if (origEnv !== undefined) {
+        process.env.TONALLI_SIMULATION = origEnv;
+      }
+    }
   });
 });

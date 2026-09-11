@@ -58,6 +58,7 @@ export interface DurableReservationHandle {
 export interface CommitAuthorizationInput {
   readonly reservationId: string;
   readonly leaseToken: string;
+  readonly fencingToken?: number;
   readonly nowEpochSeconds: number;
   readonly approvalStatus?: ApprovalStatus;
 }
@@ -65,6 +66,7 @@ export interface CommitAuthorizationInput {
 export interface RollbackAuthorizationInput {
   readonly reservationId: string;
   readonly leaseToken: string;
+  readonly fencingToken?: number;
   readonly nowEpochSeconds: number;
   readonly reason?: string;
 }
@@ -81,6 +83,7 @@ export interface PruneExpiredInput {
 export interface RenewLeaseInput {
   readonly reservationId: string;
   readonly leaseToken: string;
+  readonly fencingToken?: number;
   readonly additionalSeconds: number;
   readonly nowEpochSeconds: number;
 }
