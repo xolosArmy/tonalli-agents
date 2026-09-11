@@ -535,3 +535,288 @@ test("formatAuditDisplay displays byte-exact XEC amount even for huge integers",
   assert.equal(display.amountXEC, "90071992547409.92 XEC");
 });
 
+test("WalletApprovalTransport P2-1: Clock fail-closed on invalid nowEpochSeconds values", async () => {
+  const invalidClockValues = [
+    { label: "NaN", value: NaN },
+    { label: "Infinity", value: Infinity },
+    { label: "-Infinity", value: -Infinity },
+    { label: "negative value", value: -1 },
+    { label: "float", value: 1770000010.5 },
+    { label: "Number.MAX_SAFE_INTEGER + 1", value: Number.MAX_SAFE_INTEGER + 1 }
+  ];
+
+  const validReq = createValidRequest();
+  const dummyPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest() {
+      throw new Error("Should not be called");
+    }
+  };
+
+  for (const { label, value } of invalidClockValues) {
+    const transport = createWalletApprovalTransport({
+      killSwitch: false,
+      monetaryLimitSats: 1000,
+      nowEpochSeconds: () => value
+    });
+
+    // validateOutboundRequest must fail closed with INVALID_CLOCK
+    assert.throws(
+      () => transport.validateOutboundRequest(validReq),
+      (err: unknown) => {
+        assert.ok(err instanceof WalletApprovalTransportError, `Expected WalletApprovalTransportError for ${label}`);
+        assert.equal(err.code, "INVALID_CLOCK", `Expected INVALID_CLOCK for ${label}, got ${err.code}`);
+        return true;
+      },
+      `Should have thrown INVALID_CLOCK for clock=${label}`
+    );
+
+    // dispatchApprovalRequest must fail closed with INVALID_CLOCK
+    await assert.rejects(
+      async () => transport.dispatchApprovalRequest(validReq, dummyPort),
+      (err: unknown) => {
+        assert.ok(err instanceof WalletApprovalTransportError, `Expected WalletApprovalTransportError for ${label}`);
+        assert.equal(err.code, "INVALID_CLOCK", `Expected INVALID_CLOCK for ${label}, got ${err.code}`);
+        return true;
+      },
+      `Should have rejected with INVALID_CLOCK for clock=${label}`
+    );
+  }
+});
+
+test("WalletApprovalTransport P2-3: Replay retention bounded - replay before expiry blocked, expired entry purged", async () => {
+  let currentClock = 1770000010;
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1000,
+    nowEpochSeconds: () => currentClock
+  });
+
+  const request = createValidRequest({
+    requestId: "req-p23-single",
+    requestedAt: 1770000000,
+    expiresAt: 1770000100
+  });
+
+  const mockPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p23-single",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: currentClock
+      };
+    }
+  };
+
+  // Initial dispatch succeeds and commits reservation
+  const receipt = await transport.dispatchApprovalRequest(request, mockPort);
+  assert.equal(receipt.status, "approved");
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // Replay before expiry (currentClock = 1770000050 < expiresAt = 1770000100) must be blocked
+  currentClock = 1770000050;
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(request, mockPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "REPLAY_DETECTED");
+      return true;
+    }
+  );
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // Advance clock beyond expiry (currentClock = 1770000105 >= expiresAt = 1770000100)
+  currentClock = 1770000105;
+  const pruned = transport.pruneExpired();
+  assert.equal(pruned, 1, "Expired entry should be pruned");
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 0 });
+});
+
+test("WalletApprovalTransport P2-3: Multiple expired entries are purged deterministically", async () => {
+  let currentClock = 1770000010;
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 10000,
+    nowEpochSeconds: () => currentClock
+  });
+
+  const makeReq = (id: string, exp: number) => {
+    const intentId = `intent-multi-${id}-012345`;
+    return createValidRequest({
+      requestId: `req-multi-${id}`,
+      intent: {
+        ...BASE_VALID_INTENT,
+        intentId,
+        nonce: `nonce-multi-${id}-012345678901`,
+        expiresAt: exp
+      },
+      policyDecision: {
+        ...BASE_VALID_POLICY_DECISION,
+        intentId,
+        expiresAt: exp
+      },
+      requestedAt: 1770000000,
+      expiresAt: exp
+    });
+  };
+
+  const req1 = makeReq("1", 1770000100);
+  const req2 = makeReq("2", 1770000200);
+  const req3 = makeReq("3", 1770000300);
+
+  const makePort = (id: string): WalletApprovalTransportPort => ({
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: `appr-${id}`,
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: currentClock
+      };
+    }
+  });
+
+  await transport.dispatchApprovalRequest(req1, makePort("1"));
+  await transport.dispatchApprovalRequest(req2, makePort("2"));
+  await transport.dispatchApprovalRequest(req3, makePort("3"));
+
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 3 });
+
+  // Advance clock to 1770000250 (req1 and req2 are expired, req3 expires at 300)
+  currentClock = 1770000250;
+  const prunedFirst = transport.pruneExpired();
+  assert.equal(prunedFirst, 2, "req1 and req2 should be pruned");
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // Advance clock to 1770000350 (req3 is expired)
+  currentClock = 1770000350;
+  const prunedSecond = transport.pruneExpired();
+  assert.equal(prunedSecond, 1, "req3 should be pruned");
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 0 });
+});
+
+test("WalletApprovalTransport P2-3: Pending reservations are not purged while active", async () => {
+  let currentClock = 1770000010;
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1000,
+    nowEpochSeconds: () => currentClock
+  });
+
+  const request = createValidRequest({
+    requestId: "req-p23-pending",
+    requestedAt: 1770000000,
+    expiresAt: 1770000100
+  });
+
+  let resolveDispatch!: (receipt: HumanApprovalV1) => void;
+  const slowPort: WalletApprovalTransportPort = {
+    sendApprovalRequest(req) {
+      return new Promise((resolve) => {
+        resolveDispatch = (receipt) => resolve(receipt);
+      });
+    }
+  };
+
+  const inFlightPromise = transport.dispatchApprovalRequest(request, slowPort);
+
+  // While in flight, pending = 1, committed = 0
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 1, committed: 0 });
+
+  // Advance clock and trigger pruning: pending reservation must NOT be purged
+  currentClock = 1770000050;
+  const pruned = transport.pruneExpired();
+  assert.equal(pruned, 0);
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 1, committed: 0 });
+
+  // Duplicate dispatch while pending must still be blocked
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(request, slowPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "REPLAY_DETECTED");
+      return true;
+    }
+  );
+
+  // Complete in-flight dispatch
+  resolveDispatch({
+    contractVersion: AGENTIC_CONTRACT_VERSION,
+    kind: "human_approval",
+    approvalId: "appr-p23-pending-done",
+    requestId: request.requestId,
+    intentId: request.intent.intentId,
+    decisionId: request.policyDecision.decisionId,
+    status: "approved",
+    approver: request.intent.fromAddress,
+    recordedAt: currentClock
+  });
+
+  await inFlightPromise;
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+});
+
+test("WalletApprovalTransport P2-3: Dispatch failure rolls back pending reservation cleanly", async () => {
+  let currentClock = 1770000010;
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1000,
+    nowEpochSeconds: () => currentClock
+  });
+
+  const request = createValidRequest({
+    requestId: "req-p23-rollback",
+    requestedAt: 1770000000,
+    expiresAt: 1770000100
+  });
+
+  const failingPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest() {
+      throw new Error("Simulated network/RPC error");
+    }
+  };
+
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(request, failingPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "PORT_DISPATCH_FAILED");
+      return true;
+    }
+  );
+
+  // Pending reservation rolled back, committed is 0
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 0 });
+
+  // Retry with working port succeeds
+  const workingPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p23-retry",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: currentClock
+      };
+    }
+  };
+
+  const receipt = await transport.dispatchApprovalRequest(request, workingPort);
+  assert.equal(receipt.status, "approved");
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+});
+
+

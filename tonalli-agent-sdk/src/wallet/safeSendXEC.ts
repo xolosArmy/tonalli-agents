@@ -108,14 +108,25 @@ export async function safeSendXEC(
         expiresAt
       });
 
+      if (dependencies.walletApprovalPort && !dependencies.walletTransport) {
+        throw new WalletApprovalTransportError(
+          "MISSING_WALLET_TRANSPORT",
+          "walletApprovalPort was provided without a preconfigured walletTransport. Fail-closed: transport must be explicitly composed."
+        );
+      }
+
+      if (dependencies.walletTransport) {
+        dependencies.walletTransport.validateOutboundRequest(walletApprovalRequest);
+      }
+
+      emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
+        intentId: intent.intentId,
+        requestId: walletApprovalRequest.requestId,
+        policyTraceId: policyDecision.policyTraceId
+      });
+
       let humanApproval: HumanApprovalV1 | undefined;
-      if (dependencies.walletApprovalPort) {
-        if (!dependencies.walletTransport) {
-          throw new WalletApprovalTransportError(
-            "MISSING_WALLET_TRANSPORT",
-            "walletApprovalPort was provided without a preconfigured walletTransport. Fail-closed: transport must be explicitly composed."
-          );
-        }
+      if (dependencies.walletApprovalPort && dependencies.walletTransport) {
         humanApproval = await dependencies.walletTransport.dispatchApprovalRequest(
           walletApprovalRequest,
           dependencies.walletApprovalPort
@@ -130,12 +141,6 @@ export async function safeSendXEC(
         walletApprovalRequest,
         ...(humanApproval ? { humanApproval } : {}),
         ...stoppedStages
-      });
-
-      emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
-        intentId: intent.intentId,
-        requestId: walletApprovalRequest.requestId,
-        policyTraceId: policyDecision.policyTraceId
       });
 
       if (!humanApproval) {
@@ -206,10 +211,27 @@ export async function safeSendXEC(
       workflow
     };
   } catch (error: any) {
-    emitEvent(Topics.POLICY_REJECTED, {
-      intentId: intent.intentId,
-      error: error instanceof Error ? error.message : "Unknown fail-closed error"
-    });
+    if (
+      error instanceof WalletApprovalTransportError ||
+      (error instanceof Error && error.name === "WalletApprovalTransportError")
+    ) {
+      const transportCode =
+        error instanceof WalletApprovalTransportError
+          ? error.code
+          : "code" in error && typeof (error as any).code === "string"
+            ? (error as any).code
+            : "UNKNOWN_TRANSPORT_ERROR";
+      emitEvent(Topics.WALLET_APPROVAL_TRANSPORT_FAILED, {
+        intentId: intent.intentId,
+        code: transportCode,
+        error: error.message
+      });
+    } else {
+      emitEvent(Topics.POLICY_REJECTED, {
+        intentId: intent.intentId,
+        error: error instanceof Error ? error.message : "Unknown fail-closed error"
+      });
+    }
     throw error;
   }
 }

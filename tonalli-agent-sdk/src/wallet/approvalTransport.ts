@@ -55,7 +55,8 @@ export type WalletApprovalTransportErrorCode =
   | "PORT_DISPATCH_FAILED"
   | "INVALID_RESPONSE_SCHEMA"
   | "RESPONSE_BINDING_MISMATCH"
-  | "RESPONSE_EXPIRED_MISMATCH";
+  | "RESPONSE_EXPIRED_MISMATCH"
+  | "INVALID_CLOCK";
 
 export class WalletApprovalTransportError extends Error {
   readonly code: WalletApprovalTransportErrorCode;
@@ -70,6 +71,14 @@ export class WalletApprovalTransportError extends Error {
     this.name = "WalletApprovalTransportError";
     this.code = code;
     this.details = details;
+  }
+
+  static [Symbol.hasInstance](instance: unknown): boolean {
+    return (
+      instance instanceof Error &&
+      instance.name === "WalletApprovalTransportError" &&
+      typeof (instance as any).code === "string"
+    );
   }
 }
 
@@ -123,6 +132,8 @@ export interface WalletApprovalTransport {
     requestInput: unknown,
     port: WalletApprovalTransportPort
   ) => Promise<HumanApprovalV1>;
+  readonly pruneExpired: () => number;
+  readonly getReplayCacheStats: () => { pending: number; committed: number };
 }
 
 /**
@@ -136,23 +147,77 @@ export function createWalletApprovalTransport(
   const monetaryLimitSats = BigInt(config.monetaryLimitSats ?? 0);
   const getNow = config.nowEpochSeconds ?? (() => Math.floor(Date.now() / 1000));
 
-  /**
-   * NON-DURABLE IN-MEMORY REPLAY CACHE
-   * WARNING: This in-memory reservation tracking is process-local and transient.
-   * It does NOT provide durable or multi-instance security against replay attacks.
-   * Durable replay protection and atomic state transitions must be enforced
-   * by the CAE durable store and the Wallet-owned authorization ledger.
-   */
-  const pendingReservations = new Map<string, { intentId: string; nonce: string }>();
-  const committedRequestIds = new Set<string>();
-  const committedIntentIds = new Set<string>();
-  const committedNonces = new Set<string>();
-
-  function reserveRequest(requestId: string, intentId: string, nonce: string): void {
+  function getValidNowEpochSeconds(): number {
+    const now = getNow();
     if (
-      committedRequestIds.has(requestId) ||
-      committedIntentIds.has(intentId) ||
-      committedNonces.has(nonce)
+      typeof now !== "number" ||
+      !Number.isFinite(now) ||
+      !Number.isInteger(now) ||
+      !Number.isSafeInteger(now) ||
+      now < 0
+    ) {
+      throw new WalletApprovalTransportError(
+        "INVALID_CLOCK",
+        `Invalid clock value produced by nowEpochSeconds: ${now}. Expected non-negative safe integer.`
+      );
+    }
+    return now;
+  }
+
+  /**
+   * BOUNDED IN-MEMORY REPLAY CACHE (NON-DURABLE FALLBACK)
+   *
+   * CRITICAL SECURITY BOUNDARY NOTE:
+   * This in-memory cache bounds heap memory growth in long-running processes by
+   * pruning committed entries whose canonical validity window (expiresAt) has elapsed.
+   *
+   * WARNING: This retention is STRICTLY PROCESS-LOCAL AND VOLATILE.
+   * It does NOT provide durable replay protection across restarts, multi-instance
+   * deployments, horizontal scaling, or real-funds settlement. Durable replay
+   * protection and atomic state transitions must be enforced by the shared
+   * transactional CAE store and the Wallet-owned authorization ledger.
+   */
+  interface CommittedReplayEntry {
+    readonly requestId: string;
+    readonly intentId: string;
+    readonly nonce: string;
+    readonly expiresAt: number;
+  }
+
+  const pendingReservations = new Map<
+    string,
+    { intentId: string; nonce: string; expiresAt: number }
+  >();
+  const committedEntries = new Map<string, CommittedReplayEntry>();
+  const committedIntentIndex = new Map<string, string>();
+  const committedNonceIndex = new Map<string, string>();
+
+  function pruneExpiredEntries(currentEpoch: number): number {
+    let prunedCount = 0;
+    for (const [requestId, entry] of committedEntries.entries()) {
+      if (entry.expiresAt <= currentEpoch) {
+        committedEntries.delete(requestId);
+        committedIntentIndex.delete(entry.intentId);
+        committedNonceIndex.delete(entry.nonce);
+        prunedCount++;
+      }
+    }
+    return prunedCount;
+  }
+
+  function reserveRequest(
+    requestId: string,
+    intentId: string,
+    nonce: string,
+    expiresAt: number,
+    now: number
+  ): void {
+    pruneExpiredEntries(now);
+
+    if (
+      committedEntries.has(requestId) ||
+      committedIntentIndex.has(intentId) ||
+      committedNonceIndex.has(nonce)
     ) {
       throw new WalletApprovalTransportError(
         "REPLAY_DETECTED",
@@ -167,16 +232,21 @@ export function createWalletApprovalTransport(
         );
       }
     }
-    pendingReservations.set(requestId, { intentId, nonce });
+    pendingReservations.set(requestId, { intentId, nonce, expiresAt });
   }
 
   function commitReservation(requestId: string): void {
     const reserved = pendingReservations.get(requestId);
     if (reserved) {
       pendingReservations.delete(requestId);
-      committedRequestIds.add(requestId);
-      committedIntentIds.add(reserved.intentId);
-      committedNonces.add(reserved.nonce);
+      committedEntries.set(requestId, {
+        requestId,
+        intentId: reserved.intentId,
+        nonce: reserved.nonce,
+        expiresAt: reserved.expiresAt
+      });
+      committedIntentIndex.set(reserved.intentId, requestId);
+      committedNonceIndex.set(reserved.nonce, requestId);
     }
   }
 
@@ -257,7 +327,7 @@ export function createWalletApprovalTransport(
       );
     }
 
-    const now = getNow();
+    const now = getValidNowEpochSeconds();
     if (parsed.requestedAt > now + 60) {
       throw new WalletApprovalTransportError(
         "REQUEST_NOT_YET_VALID",
@@ -310,11 +380,14 @@ export function createWalletApprovalTransport(
     port: WalletApprovalTransportPort
   ): Promise<HumanApprovalV1> {
     const validatedRequest = validateOutboundRequest(requestInput);
+    const now = getValidNowEpochSeconds();
 
     reserveRequest(
       validatedRequest.requestId,
       validatedRequest.intent.intentId,
-      validatedRequest.intent.nonce
+      validatedRequest.intent.nonce,
+      validatedRequest.expiresAt,
+      now
     );
 
     let walletResponse: unknown;
@@ -409,6 +482,11 @@ export function createWalletApprovalTransport(
   return {
     validateOutboundRequest,
     formatAuditDisplay,
-    dispatchApprovalRequest
+    dispatchApprovalRequest,
+    pruneExpired: () => pruneExpiredEntries(getValidNowEpochSeconds()),
+    getReplayCacheStats: () => ({
+      pending: pendingReservations.size,
+      committed: committedEntries.size
+    })
   };
 }

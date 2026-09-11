@@ -31,8 +31,12 @@ if [ -z "$AGENTS_SHA" ] || [ -z "$WALLET_SHA" ]; then
   exit 1
 fi
 
-# Strict 40-character hex SHA validation
-HEX_REGEX='^[0-9a-fA-F]{40}$'
+# Normalize accepted hex SHAs to canonical lowercase before validation, checkout, and comparison
+AGENTS_SHA="${AGENTS_SHA,,}"
+WALLET_SHA="${WALLET_SHA,,}"
+
+# Strict 40-character hex SHA validation (canonical lowercase)
+HEX_REGEX='^[0-9a-f]{40}$'
 if [[ ! "$AGENTS_SHA" =~ $HEX_REGEX ]]; then
   echo "ERROR: AGENTS_SHA must be an exact 40-character hexadecimal commit SHA. Got: '$AGENTS_SHA'" >&2
   exit 1
@@ -42,6 +46,10 @@ if [[ ! "$WALLET_SHA" =~ $HEX_REGEX ]]; then
   echo "ERROR: WALLET_SHA must be an exact 40-character hexadecimal commit SHA. Got: '$WALLET_SHA'" >&2
   exit 1
 fi
+
+echo "=== [Gate 2 Cross-Repo Contract Harness] ==="
+echo "tonalli-agents target SHA: $AGENTS_SHA"
+echo "RMZWallet target SHA:      $WALLET_SHA"
 
 # NODE_AUTH_TOKEN validation before installing RMZWallet (required for @xolosarmy GitHub packages)
 if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
