@@ -26,6 +26,7 @@ process.env.AGENT_ROLE = "test";
 process.env.AGENT_WALLET = "ecash:qz2708636snqhsxu8wnlka78h6fdp77ar59j2t0fh2";
 process.env.AGENT_DAILY_LIMIT_SATS = "1000000";
 process.env.AGENT_INTENT_TTL_SECONDS = "300";
+process.env.TONALLI_SIMULATION = "true";
 
 import assert from "node:assert/strict";
 import test from "node:test";
