@@ -498,70 +498,89 @@ export function createWalletApprovalTransport(
       validatedRequest.policyDecision.expiresAt
     );
 
-    // Heartbeat lease renewal while awaiting Wallet port response
-    // Bounds renewal to canonical workflow validity window
-    let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+    // Heartbeat lease renewal while awaiting Wallet port response.
+    // Serialized and awaitable to prevent detached in-flight mutations after shutdown.
+    let heartbeatTimer: ReturnType<typeof setTimeout> | null = null;
     let heartbeatStopped = false;
-
-    const stopHeartbeat = () => {
-      heartbeatStopped = true;
-      if (heartbeatTimer !== null) {
-        clearInterval(heartbeatTimer);
-        heartbeatTimer = null;
-      }
-    };
+    let inFlightRenewal: Promise<void> | null = null;
 
     const intervalMs = heartbeatIntervalMs ?? Math.max(500, Math.floor((leaseDurationSeconds * 1000) / 2));
 
-    const renewLeaseHeartbeat = async () => {
+    const scheduleNextHeartbeat = () => {
       if (heartbeatStopped) return;
-      const currentNow = getValidNowEpochSeconds();
-      if (currentNow >= canonicalWorkflowExpiry) {
-        stopHeartbeat();
-        return;
-      }
+      heartbeatTimer = setTimeout(() => {
+        if (heartbeatStopped) return;
+        inFlightRenewal = (async () => {
+          try {
+            const currentNow = getValidNowEpochSeconds();
+            if (currentNow >= canonicalWorkflowExpiry) {
+              heartbeatStopped = true;
+              return;
+            }
 
-      const remainingWorkflowSeconds = canonicalWorkflowExpiry - currentNow;
-      const additionalSeconds = Math.min(leaseDurationSeconds, remainingWorkflowSeconds);
-      if (additionalSeconds <= 0) {
-        stopHeartbeat();
-        return;
-      }
+            const remainingWorkflowSeconds = canonicalWorkflowExpiry - currentNow;
+            const additionalSeconds = Math.min(leaseDurationSeconds, remainingWorkflowSeconds);
+            if (additionalSeconds <= 0) {
+              heartbeatStopped = true;
+              return;
+            }
 
-      try {
-        if (typeof durableStore.renewLease === "function") {
-          const renewed = await durableStore.renewLease({
-            reservationId: currentHandle.reservationId,
-            leaseToken: currentHandle.leaseToken,
-            fencingToken: currentHandle.fencingToken,
-            additionalSeconds,
-            nowEpochSeconds: currentNow
-          });
-          currentHandle = renewed;
-        }
-      } catch {
-        // If renewal fails (e.g. lease superseded or expired), stop further heartbeat
-        stopHeartbeat();
+            if (typeof durableStore.renewLease === "function") {
+              const renewed = await durableStore.renewLease({
+                reservationId: currentHandle.reservationId,
+                leaseToken: currentHandle.leaseToken,
+                fencingToken: currentHandle.fencingToken,
+                additionalSeconds,
+                nowEpochSeconds: currentNow
+              });
+              currentHandle = renewed;
+            }
+          } catch {
+            // If renewal fails (e.g. lease superseded or expired), stop further renewals
+            heartbeatStopped = true;
+          } finally {
+            inFlightRenewal = null;
+          }
+
+          if (!heartbeatStopped) {
+            scheduleNextHeartbeat();
+          }
+        })();
+      }, intervalMs);
+      heartbeatTimer.unref();
+    };
+
+    const stopHeartbeat = async (): Promise<void> => {
+      heartbeatStopped = true;
+      if (heartbeatTimer !== null) {
+        clearTimeout(heartbeatTimer);
+        heartbeatTimer = null;
+      }
+      if (inFlightRenewal !== null) {
+        await inFlightRenewal;
       }
     };
 
-    heartbeatTimer = setInterval(() => {
-      void renewLeaseHeartbeat();
-    }, intervalMs);
-    heartbeatTimer.unref();
+    // Schedule the initial heartbeat tick
+    scheduleNextHeartbeat();
 
     let walletResponse: unknown;
+    let dispatchError: unknown = null;
     try {
       walletResponse = await port.sendApprovalRequest(validatedRequest);
     } catch (err) {
-      stopHeartbeat();
+      dispatchError = err;
+    } finally {
+      // Must await quiescence of any in-flight renewal before any terminal commit or rollback!
+      await stopHeartbeat();
+    }
+
+    if (dispatchError !== null) {
       return rollbackAndFail(
         "PORT_DISPATCH_FAILED",
-        `Wallet transport port failed to dispatch request: ${err instanceof Error ? err.message : String(err)}`,
-        err
+        `Wallet transport port failed to dispatch request: ${dispatchError instanceof Error ? dispatchError.message : String(dispatchError)}`,
+        dispatchError
       );
-    } finally {
-      stopHeartbeat();
     }
 
     let parsedResponse: HumanApprovalV1;

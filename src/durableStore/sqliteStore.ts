@@ -53,6 +53,28 @@ export interface SqliteStoreConfig {
   isSimulation?: boolean;
 }
 
+/**
+ * Fail-closed validation for fencingToken:
+ * Must be a positive safe integer (> 0).
+ * Throws LEASE_SUPERSEDED if missing, undefined, NaN, infinite, non-integer, unsafe, or <= 0.
+ */
+function validateFencingToken(fencingToken: unknown): number {
+  if (
+    typeof fencingToken !== "number" ||
+    Number.isNaN(fencingToken) ||
+    !Number.isFinite(fencingToken) ||
+    !Number.isInteger(fencingToken) ||
+    !Number.isSafeInteger(fencingToken) ||
+    fencingToken <= 0
+  ) {
+    throw new DurableStoreError(
+      "LEASE_SUPERSEDED",
+      `Invalid or missing fencing token: expected positive safe integer, received ${String(fencingToken)}`
+    );
+  }
+  return fencingToken;
+}
+
 export class SqliteDurableAuthorizationStore implements DurableAuthorizationStore {
   private readonly db: DatabaseSync;
   private readonly dbPath: string;
@@ -413,6 +435,7 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
    */
   commitAuthorization(input: CommitAuthorizationInput): void {
     this.ensureOpen();
+    const fencingToken = validateFencingToken(input.fencingToken);
     const now = input.nowEpochSeconds;
     const approvalStatus = input.approvalStatus ?? "approved";
 
@@ -436,22 +459,26 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
         );
       }
 
-      if (record.state === "COMMITTED") {
-        if (record.lease_token === input.leaseToken) {
-          if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
-            throw new DurableStoreError(
-              "LEASE_SUPERSEDED",
-              `Commit rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
-            );
-          }
-          // Idempotent commit by the same valid owner
-          this.db.exec("COMMIT;");
-          return;
-        }
+      // Mandatory ownership and fencing generation verification:
+      // leaseToken alone MUST NEVER authorize a state transition or idempotent success.
+      if (record.lease_token !== input.leaseToken) {
         throw new DurableStoreError(
           "LEASE_SUPERSEDED",
-          `Commit rejected: reservation '${input.reservationId}' was already committed under a different lease token`
+          `Commit rejected: lease token mismatch for reservation '${input.reservationId}'`
         );
+      }
+
+      if (Number(record.fencing_token) !== fencingToken) {
+        throw new DurableStoreError(
+          "LEASE_SUPERSEDED",
+          `Commit rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${fencingToken}`
+        );
+      }
+
+      // Idempotent commit: ONLY allowed if caller holds the matching leaseToken AND the exact current fencing_token
+      if (record.state === "COMMITTED") {
+        this.db.exec("COMMIT;");
+        return;
       }
 
       if (record.state === "ROLLED_BACK") {
@@ -472,20 +499,6 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
         throw new DurableStoreError(
           "LEASE_SUPERSEDED",
           `Commit rejected: reservation '${input.reservationId}' is in unexpected state '${record.state}'`
-        );
-      }
-
-      if (record.lease_token !== input.leaseToken) {
-        throw new DurableStoreError(
-          "LEASE_SUPERSEDED",
-          `Commit rejected: lease token mismatch for reservation '${input.reservationId}'`
-        );
-      }
-
-      if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
-        throw new DurableStoreError(
-          "LEASE_SUPERSEDED",
-          `Commit rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
         );
       }
 
@@ -574,6 +587,7 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
    */
   rollbackAuthorization(input: RollbackAuthorizationInput): void {
     this.ensureOpen();
+    const fencingToken = validateFencingToken(input.fencingToken);
     const now = input.nowEpochSeconds;
 
     try {
@@ -596,14 +610,24 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
         );
       }
 
+      // Mandatory ownership and fencing generation verification:
+      // leaseToken alone MUST NEVER authorize a state transition or idempotent success.
+      if (record.lease_token !== input.leaseToken) {
+        throw new DurableStoreError(
+          "LEASE_SUPERSEDED",
+          `Rollback rejected: lease token mismatch for reservation '${input.reservationId}'`
+        );
+      }
+
+      if (Number(record.fencing_token) !== fencingToken) {
+        throw new DurableStoreError(
+          "LEASE_SUPERSEDED",
+          `Rollback rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${fencingToken}`
+        );
+      }
+
+      // Idempotent rollback: ONLY allowed if caller holds the matching leaseToken AND the exact current fencing_token
       if (record.state === "ROLLED_BACK") {
-        if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
-          throw new DurableStoreError(
-            "LEASE_SUPERSEDED",
-            `Rollback rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
-          );
-        }
-        // Idempotent rollback
         this.db.exec("COMMIT;");
         return;
       }
@@ -622,20 +646,6 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
       }
 
       if (record.state === "PENDING") {
-        if (record.lease_token !== input.leaseToken) {
-          throw new DurableStoreError(
-            "LEASE_SUPERSEDED",
-            `Rollback rejected: lease token mismatch for reservation '${input.reservationId}'`
-          );
-        }
-
-        if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
-          throw new DurableStoreError(
-            "LEASE_SUPERSEDED",
-            `Rollback rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
-          );
-        }
-
         this.db.prepare(`
           UPDATE authorization_reservations
           SET state = 'ROLLED_BACK', rollback_reason = ?, updated_at = ?
@@ -666,6 +676,7 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
    */
   renewLease(input: RenewLeaseInput): DurableReservationHandle {
     this.ensureOpen();
+    const fencingToken = validateFencingToken(input.fencingToken);
     const now = input.nowEpochSeconds;
 
     try {
@@ -689,14 +700,15 @@ export class SqliteDurableAuthorizationStore implements DurableAuthorizationStor
         throw new DurableStoreError("LEASE_SUPERSEDED", `Cannot renew lease for reservation in state '${record.state}'`);
       }
 
+      // Mandatory ownership and fencing generation verification:
       if (record.lease_token !== input.leaseToken) {
         throw new DurableStoreError("LEASE_SUPERSEDED", `Lease token mismatch on renewal for '${input.reservationId}'`);
       }
 
-      if (input.fencingToken !== undefined && Number(record.fencing_token) !== input.fencingToken) {
+      if (Number(record.fencing_token) !== fencingToken) {
         throw new DurableStoreError(
           "LEASE_SUPERSEDED",
-          `Renewal rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${input.fencingToken}`
+          `Renewal rejected: fencing token generation mismatch for reservation '${input.reservationId}'. Expected ${record.fencing_token}, received ${fencingToken}`
         );
       }
 

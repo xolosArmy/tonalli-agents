@@ -497,6 +497,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
       store.commitAuthorization({
         reservationId: h.reservationId,
         leaseToken: h.leaseToken,
+        fencingToken: h.fencingToken,
         nowEpochSeconds: 1770000010,
         approvalStatus: "approved"
       });
@@ -505,6 +506,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
       store.rollbackAuthorization({
         reservationId: h.reservationId,
         leaseToken: h.leaseToken,
+        fencingToken: h.fencingToken,
         nowEpochSeconds: 1770000010,
         reason: "race_rollback"
       });
@@ -543,6 +545,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.commitAuthorization({
       reservationId: h.reservationId,
       leaseToken: h.leaseToken,
+      fencingToken: h.fencingToken,
       nowEpochSeconds: 1770000010
     });
 
@@ -550,6 +553,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
       store.commitAuthorization({
         reservationId: h.reservationId,
         leaseToken: h.leaseToken,
+        fencingToken: h.fencingToken,
         nowEpochSeconds: 1770000011
       });
     });
@@ -578,6 +582,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.rollbackAuthorization({
       reservationId: h.reservationId,
       leaseToken: h.leaseToken,
+      fencingToken: h.fencingToken,
       nowEpochSeconds: 1770000010
     });
 
@@ -585,6 +590,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
       store.rollbackAuthorization({
         reservationId: h.reservationId,
         leaseToken: h.leaseToken,
+        fencingToken: h.fencingToken,
         nowEpochSeconds: 1770000011
       });
     });
@@ -613,6 +619,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.commitAuthorization({
       reservationId: h.reservationId,
       leaseToken: h.leaseToken,
+      fencingToken: h.fencingToken,
       nowEpochSeconds: 1770000010
     });
 
@@ -621,6 +628,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
         store.rollbackAuthorization({
           reservationId: h.reservationId,
           leaseToken: h.leaseToken,
+          fencingToken: h.fencingToken,
           nowEpochSeconds: 1770000011
         }),
       (err: unknown) => {
@@ -654,6 +662,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.rollbackAuthorization({
       reservationId: h.reservationId,
       leaseToken: h.leaseToken,
+      fencingToken: h.fencingToken,
       nowEpochSeconds: 1770000010
     });
 
@@ -662,6 +671,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
         store.commitAuthorization({
           reservationId: h.reservationId,
           leaseToken: h.leaseToken,
+          fencingToken: h.fencingToken,
           nowEpochSeconds: 1770000011
         }),
       (err: unknown) => {
@@ -760,6 +770,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
         store.commitAuthorization({
           reservationId: h.reservationId,
           leaseToken: h.leaseToken,
+          fencingToken: h.fencingToken,
           nowEpochSeconds: 1770000020
         }),
       (err: unknown) => {
@@ -796,6 +807,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     client1.commitAuthorization({
       reservationId: handle.reservationId,
       leaseToken: handle.leaseToken,
+      fencingToken: handle.fencingToken,
       nowEpochSeconds: 1770000010
     });
     client1.close();
@@ -849,6 +861,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     client1.commitAuthorization({
       reservationId: h.reservationId,
       leaseToken: h.leaseToken,
+      fencingToken: h.fencingToken,
       nowEpochSeconds: 1770000010,
       approvalStatus: "approved"
     });
@@ -913,6 +926,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.commitAuthorization({
       reservationId: hDay1.reservationId,
       leaseToken: hDay1.leaseToken,
+      fencingToken: hDay1.fencingToken,
       nowEpochSeconds: tDay1End,
       approvalStatus: "approved"
     });
@@ -980,6 +994,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.commitAuthorization({
       reservationId: h.reservationId,
       leaseToken: h.leaseToken,
+      fencingToken: h.fencingToken,
       nowEpochSeconds: 1770000010
     });
 
@@ -1221,6 +1236,7 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
     store.commitAuthorization({
       reservationId: handle1.reservationId,
       leaseToken: handle1.leaseToken,
+      fencingToken: handle1.fencingToken,
       approvalStatus: "approved",
       nowEpochSeconds: dayStartEpoch + 20
     });
@@ -1636,5 +1652,542 @@ test("Durable Store Concurrency & ACID Integrity Test Suite", async (t) => {
         process.env.TONALLI_SIMULATION = origEnv;
       }
     }
+  });
+
+  // 27. Grok P1 Remediation: Direct store mandatory fencing generation fail-closed tests (Tests 1-9)
+  await t.test("Scenario 27: Direct store mandatory fencing generation fail-closed tests", () => {
+    const store = createSqliteDurableStore({ dbPath: dbFile });
+
+    // Test 1-5: Generation advance and rejection of omitted / stale generation
+    const h1 = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-fence-dir-${randomUUID()}`,
+        intentId: `intent-fence-dir-${randomUUID()}`,
+        intentNonce: `nonce-fence-dir-${randomUUID()}`
+      },
+      spending: BASE_SPENDING,
+      amountSats: 20n,
+      dailyLimitSats: 1000n,
+      requestRequestedAt: 1770000000,
+      requestExpiresAt: 1770000300,
+      nowEpochSeconds: 1770000005,
+      ownerId: "worker-fence-dir"
+    });
+    assert.equal(h1.fencingToken, 1);
+
+    const h2 = store.renewLease({
+      reservationId: h1.reservationId,
+      leaseToken: h1.leaseToken,
+      fencingToken: h1.fencingToken,
+      additionalSeconds: 30,
+      nowEpochSeconds: 1770000010
+    });
+    assert.equal(h2.fencingToken, 2);
+
+    // Test 1: commit with omitted fencingToken fails closed
+    assert.throws(
+      () =>
+        (store.commitAuthorization as any)({
+          reservationId: h2.reservationId,
+          leaseToken: h2.leaseToken,
+          nowEpochSeconds: 1770000015
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 2: commit with stale fencingToken=1 fails closed
+    assert.throws(
+      () =>
+        store.commitAuthorization({
+          reservationId: h2.reservationId,
+          leaseToken: h2.leaseToken,
+          fencingToken: 1,
+          nowEpochSeconds: 1770000015
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 3: rollback with stale fencingToken=1 fails closed
+    assert.throws(
+      () =>
+        store.rollbackAuthorization({
+          reservationId: h2.reservationId,
+          leaseToken: h2.leaseToken,
+          fencingToken: 1,
+          nowEpochSeconds: 1770000015
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 4: renew with stale fencingToken=1 fails closed
+    assert.throws(
+      () =>
+        store.renewLease({
+          reservationId: h2.reservationId,
+          leaseToken: h2.leaseToken,
+          fencingToken: 1,
+          additionalSeconds: 30,
+          nowEpochSeconds: 1770000015
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 5: commit with current fencingToken=2 succeeds
+    store.commitAuthorization({
+      reservationId: h2.reservationId,
+      leaseToken: h2.leaseToken,
+      fencingToken: 2,
+      nowEpochSeconds: 1770000015
+    });
+
+    // Test 6 & 7: Ownership predicate: leaseToken alone NEVER authorizes transition
+    const h3 = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-ownership-${randomUUID()}`,
+        intentId: `intent-ownership-${randomUUID()}`,
+        intentNonce: `nonce-ownership-${randomUUID()}`
+      },
+      spending: BASE_SPENDING,
+      amountSats: 20n,
+      dailyLimitSats: 1000n,
+      requestRequestedAt: 1770000000,
+      requestExpiresAt: 1770000300,
+      nowEpochSeconds: 1770000005,
+      ownerId: "worker-ownership"
+    });
+
+    // Test 6: wrong leaseToken + correct fencingToken fails
+    assert.throws(
+      () =>
+        store.commitAuthorization({
+          reservationId: h3.reservationId,
+          leaseToken: "wrong-lease-token",
+          fencingToken: h3.fencingToken,
+          nowEpochSeconds: 1770000010
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 7: correct leaseToken + wrong fencingToken fails
+    assert.throws(
+      () =>
+        store.commitAuthorization({
+          reservationId: h3.reservationId,
+          leaseToken: h3.leaseToken,
+          fencingToken: 9999,
+          nowEpochSeconds: 1770000010
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 8: duplicate commit with exact same valid generation is idempotent
+    store.commitAuthorization({
+      reservationId: h3.reservationId,
+      leaseToken: h3.leaseToken,
+      fencingToken: h3.fencingToken,
+      nowEpochSeconds: 1770000010
+    });
+    assert.doesNotThrow(() => {
+      store.commitAuthorization({
+        reservationId: h3.reservationId,
+        leaseToken: h3.leaseToken,
+        fencingToken: h3.fencingToken,
+        nowEpochSeconds: 1770000011
+      });
+    });
+    // But duplicate commit with wrong fencingToken or wrong leaseToken still fails LEASE_SUPERSEDED:
+    assert.throws(
+      () =>
+        store.commitAuthorization({
+          reservationId: h3.reservationId,
+          leaseToken: h3.leaseToken,
+          fencingToken: 9999,
+          nowEpochSeconds: 1770000012
+        }),
+      (err: unknown) => {
+        assert.ok(err instanceof DurableStoreError);
+        assert.equal(err.code, "LEASE_SUPERSEDED");
+        return true;
+      }
+    );
+
+    // Test 9: Untyped runtime validation fail-closed on invalid fencingToken
+    const h4 = store.reserveAuthorization({
+      identifiers: {
+        requestId: `req-untyped-${randomUUID()}`,
+        intentId: `intent-untyped-${randomUUID()}`,
+        intentNonce: `nonce-untyped-${randomUUID()}`
+      },
+      spending: BASE_SPENDING,
+      amountSats: 15n,
+      dailyLimitSats: 1000n,
+      requestRequestedAt: 1770000000,
+      requestExpiresAt: 1770000300,
+      nowEpochSeconds: 1770000005,
+      ownerId: "worker-untyped"
+    });
+
+    const invalidFencingTokens = [
+      undefined,
+      null,
+      NaN,
+      Infinity,
+      -Infinity,
+      "1",
+      1.5,
+      0,
+      -1,
+      Number.MAX_SAFE_INTEGER + 100
+    ];
+
+    for (const bad of invalidFencingTokens) {
+      assert.throws(
+        () =>
+          (store.commitAuthorization as any)({
+            reservationId: h4.reservationId,
+            leaseToken: h4.leaseToken,
+            fencingToken: bad,
+            nowEpochSeconds: 1770000010
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof DurableStoreError);
+          assert.equal(err.code, "LEASE_SUPERSEDED");
+          return true;
+        }
+      );
+
+      assert.throws(
+        () =>
+          (store.rollbackAuthorization as any)({
+            reservationId: h4.reservationId,
+            leaseToken: h4.leaseToken,
+            fencingToken: bad,
+            nowEpochSeconds: 1770000010
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof DurableStoreError);
+          assert.equal(err.code, "LEASE_SUPERSEDED");
+          return true;
+        }
+      );
+
+      assert.throws(
+        () =>
+          (store.renewLease as any)({
+            reservationId: h4.reservationId,
+            leaseToken: h4.leaseToken,
+            fencingToken: bad,
+            additionalSeconds: 10,
+            nowEpochSeconds: 1770000010
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof DurableStoreError);
+          assert.equal(err.code, "LEASE_SUPERSEDED");
+          return true;
+        }
+      );
+    }
+
+    store.close();
+  });
+
+  // 28. Grok P1 Remediation: Transport heartbeat quiescence and in-flight renewal race prevention (Tests 10-14)
+  await t.test("Scenario 28: Transport heartbeat quiescence and in-flight renewal race prevention", async () => {
+    const store = createSqliteDurableStore({ dbPath: dbFile });
+
+    const createReq = (amountSats: string = "10") => {
+      const now = 1770000000;
+      const rId = randomUUID();
+      const iId = randomUUID();
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "wallet_approval_request" as const,
+        purpose: "xec_payment" as const,
+        requestId: `req-t28-${rId}`,
+        intent: {
+          contractVersion: AGENTIC_CONTRACT_VERSION,
+          kind: "agent_intent" as const,
+          intentId: `intent-t28-${iId}`,
+          nonce: `nonce-t28-${randomUUID().replace(/-/g, "")}`,
+          agentId: "agent-t28",
+          agentRole: "tester",
+          network: "xec:mainnet" as const,
+          fromAddress: FROM_ADDRESS,
+          toAddress: "ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5",
+          amountSats,
+          reason: "Scenario 28 test",
+          createdAt: now,
+          expiresAt: now + 300
+        },
+        policyDecision: {
+          contractVersion: AGENTIC_CONTRACT_VERSION,
+          kind: "cae_policy_decision" as const,
+          decisionId: `cae-t28-${rId}`,
+          intentId: `intent-t28-${iId}`,
+          decision: "needs_human_approval" as const,
+          reasonCode: "CONFIRMATION_REQUIRED",
+          reason: "Test",
+          policyTraceId: "trace-t28",
+          policyVersion: "1.0",
+          evaluatedAt: now,
+          expiresAt: now + 300
+        },
+        requestedAt: now,
+        expiresAt: now + 300
+      };
+    };
+
+    // Test 10: Human approval longer than original lease: heartbeat renews generations; final commit succeeds with latest fencing token
+    {
+      let clock = 1770000000;
+      const transport10 = createWalletApprovalTransport({
+        killSwitch: false,
+        monetaryLimitSats: 1000,
+        durableStore: store,
+        leaseDurationSeconds: 2,
+        heartbeatIntervalMs: 40,
+        nowEpochSeconds: () => clock
+      });
+
+      const req10 = createReq("10");
+
+      const slowPort10: WalletApprovalTransportPort = {
+        async sendApprovalRequest(req) {
+          await new Promise((r) => setTimeout(r, 60));
+          clock += 1;
+          await new Promise((r) => setTimeout(r, 60));
+          clock += 1;
+          await new Promise((r) => setTimeout(r, 60));
+
+          return {
+            contractVersion: AGENTIC_CONTRACT_VERSION,
+            kind: "human_approval",
+            approvalId: `appr-t10-${randomUUID()}`,
+            requestId: req.requestId,
+            intentId: req.intent.intentId,
+            decisionId: req.policyDecision.decisionId,
+            status: "approved",
+            approver: req.intent.fromAddress,
+            recordedAt: clock
+          };
+        }
+      };
+
+      const receipt10 = await transport10.dispatchApprovalRequest(req10, slowPort10);
+      assert.equal(receipt10.status, "approved");
+
+      const dbRow = (store as any).db.prepare(
+        "SELECT fencing_token, state FROM authorization_reservations WHERE request_id = ?"
+      ).get(req10.requestId) as { fencing_token: number; state: string };
+      assert.equal(dbRow.state, "COMMITTED");
+      assert.ok(dbRow.fencing_token >= 2, `Expected fencing_token >= 2, got ${dbRow.fencing_token}`);
+    }
+
+    // Test 11: stopHeartbeat while renew is in flight: waits for in-flight renewal completion; final commit uses final generation without false LEASE_SUPERSEDED
+    {
+      let clock = 1770000000;
+      let renewDelayMs = 0;
+
+      const storeWithDelay: typeof store = Object.create(store);
+      storeWithDelay.renewLease = (input) => {
+        if (renewDelayMs > 0) {
+          const start = Date.now();
+          while (Date.now() - start < renewDelayMs) {}
+        }
+        return store.renewLease(input);
+      };
+
+      const transport11 = createWalletApprovalTransport({
+        killSwitch: false,
+        monetaryLimitSats: 1000,
+        durableStore: storeWithDelay,
+        leaseDurationSeconds: 2,
+        heartbeatIntervalMs: 30,
+        nowEpochSeconds: () => clock
+      });
+
+      const req11 = createReq("15");
+
+      const racingPort: WalletApprovalTransportPort = {
+        async sendApprovalRequest(req) {
+          await new Promise((r) => setTimeout(r, 40));
+          renewDelayMs = 30;
+          return {
+            contractVersion: AGENTIC_CONTRACT_VERSION,
+            kind: "human_approval",
+            approvalId: `appr-t11-${randomUUID()}`,
+            requestId: req.requestId,
+            intentId: req.intent.intentId,
+            decisionId: req.policyDecision.decisionId,
+            status: "approved",
+            approver: req.intent.fromAddress,
+            recordedAt: clock
+          };
+        }
+      };
+
+      const receipt11 = await transport11.dispatchApprovalRequest(req11, racingPort);
+      assert.equal(receipt11.status, "approved");
+
+      const row11 = (store as any).db.prepare(
+        "SELECT fencing_token, state FROM authorization_reservations WHERE request_id = ?"
+      ).get(req11.requestId) as { fencing_token: number; state: string };
+      assert.equal(row11.state, "COMMITTED");
+      assert.ok(row11.fencing_token >= 2);
+    }
+
+    // Test 12: Transport error while renewal is in flight: heartbeat quiesces first; rollback uses final generation
+    {
+      let clock = 1770000000;
+      const transport12 = createWalletApprovalTransport({
+        killSwitch: false,
+        monetaryLimitSats: 1000,
+        durableStore: store,
+        leaseDurationSeconds: 2,
+        heartbeatIntervalMs: 30,
+        nowEpochSeconds: () => clock
+      });
+
+      const req12 = createReq("20");
+
+      const failingPort: WalletApprovalTransportPort = {
+        async sendApprovalRequest() {
+          await new Promise((r) => setTimeout(r, 50));
+          throw new Error("Simulated wallet connection dropped");
+        }
+      };
+
+      await assert.rejects(
+        async () => transport12.dispatchApprovalRequest(req12, failingPort),
+        (err: unknown) => {
+          assert.ok(err instanceof WalletApprovalTransportError);
+          assert.equal(err.code, "PORT_DISPATCH_FAILED");
+          return true;
+        }
+      );
+
+      const row12 = (store as any).db.prepare(
+        "SELECT fencing_token, state FROM authorization_reservations WHERE request_id = ?"
+      ).get(req12.requestId) as { fencing_token: number; state: string };
+      assert.equal(row12.state, "ROLLED_BACK");
+      assert.ok(row12.fencing_token >= 2);
+    }
+
+    // Test 13: Human rejection after one or more renewals: terminal transition uses current generation and commits rejection
+    {
+      let clock = 1770000000;
+      const transport13 = createWalletApprovalTransport({
+        killSwitch: false,
+        monetaryLimitSats: 1000,
+        durableStore: store,
+        leaseDurationSeconds: 2,
+        heartbeatIntervalMs: 30,
+        nowEpochSeconds: () => clock
+      });
+
+      const req13 = createReq("25");
+
+      const rejectPort: WalletApprovalTransportPort = {
+        async sendApprovalRequest(req) {
+          await new Promise((r) => setTimeout(r, 50));
+          return {
+            contractVersion: AGENTIC_CONTRACT_VERSION,
+            kind: "human_approval",
+            approvalId: `appr-t13-${randomUUID()}`,
+            requestId: req.requestId,
+            intentId: req.intent.intentId,
+            decisionId: req.policyDecision.decisionId,
+            status: "rejected",
+            approver: req.intent.fromAddress,
+            recordedAt: clock
+          };
+        }
+      };
+
+      const receipt13 = await transport13.dispatchApprovalRequest(req13, rejectPort);
+      assert.equal(receipt13.status, "rejected");
+
+      const row13 = (store as any).db.prepare(
+        "SELECT fencing_token, state, approval_status, amount_sats FROM authorization_reservations WHERE request_id = ?"
+      ).get(req13.requestId) as { fencing_token: number; state: string; approval_status: string; amount_sats: string };
+      assert.equal(row13.state, "COMMITTED");
+      assert.equal(row13.approval_status, "rejected");
+      assert.equal(row13.amount_sats, "0");
+      assert.ok(row13.fencing_token >= 2);
+    }
+
+    // Test 14: No heartbeat task remains after completion or error (no leaking renewals)
+    {
+      let clock = 1770000000;
+      let postCompletionRenewals = 0;
+
+      const storeWithSpy: typeof store = Object.create(store);
+      let dispatchFinished = false;
+      storeWithSpy.renewLease = (input) => {
+        if (dispatchFinished) {
+          postCompletionRenewals++;
+        }
+        return store.renewLease(input);
+      };
+
+      const transport14 = createWalletApprovalTransport({
+        killSwitch: false,
+        monetaryLimitSats: 1000,
+        durableStore: storeWithSpy,
+        leaseDurationSeconds: 2,
+        heartbeatIntervalMs: 25,
+        nowEpochSeconds: () => clock
+      });
+
+      const req14 = createReq("30");
+      const quickPort: WalletApprovalTransportPort = {
+        async sendApprovalRequest(req) {
+          return {
+            contractVersion: AGENTIC_CONTRACT_VERSION,
+            kind: "human_approval",
+            approvalId: `appr-t14-${randomUUID()}`,
+            requestId: req.requestId,
+            intentId: req.intent.intentId,
+            decisionId: req.policyDecision.decisionId,
+            status: "approved",
+            approver: req.intent.fromAddress,
+            recordedAt: clock
+          };
+        }
+      };
+
+      await transport14.dispatchApprovalRequest(req14, quickPort);
+      dispatchFinished = true;
+
+      await new Promise((r) => setTimeout(r, 100));
+
+      assert.equal(postCompletionRenewals, 0, "No detached heartbeat renewal should fire after dispatch completion");
+    }
+
+    store.close();
   });
 });
