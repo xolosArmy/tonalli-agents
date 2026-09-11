@@ -56,6 +56,7 @@ export type WalletApprovalTransportErrorCode =
   | "INVALID_RESPONSE_SCHEMA"
   | "RESPONSE_BINDING_MISMATCH"
   | "RESPONSE_EXPIRED_MISMATCH"
+  | "RESPONSE_OUTSIDE_WORKFLOW_WINDOW"
   | "INVALID_CLOCK";
 
 export class WalletApprovalTransportError extends Error {
@@ -462,6 +463,22 @@ export function createWalletApprovalTransport(
           `Approved response approver (${parsedResponse.approver ?? "undefined"}) does not match intent fromAddress (${validatedRequest.intent.fromAddress})`
         );
       }
+    }
+
+    const canonicalWorkflowExpiry = Math.min(
+      validatedRequest.intent.expiresAt,
+      validatedRequest.policyDecision.expiresAt
+    );
+
+    if (
+      parsedResponse.recordedAt >= validatedRequest.intent.expiresAt ||
+      parsedResponse.recordedAt >= validatedRequest.policyDecision.expiresAt
+    ) {
+      rollbackReservation(validatedRequest.requestId);
+      throw new WalletApprovalTransportError(
+        "RESPONSE_OUTSIDE_WORKFLOW_WINDOW",
+        `Wallet response recordedAt (${parsedResponse.recordedAt}) exceeds canonical workflow validity window (intent.expiresAt=${validatedRequest.intent.expiresAt}, policyDecision.expiresAt=${validatedRequest.policyDecision.expiresAt}, boundary=${canonicalWorkflowExpiry}). Receipt cannot form a canonical AgenticWorkflowV1.`
+      );
     }
 
     if (

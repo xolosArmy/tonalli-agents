@@ -249,9 +249,9 @@ test("WalletApprovalTransport negative: response recorded at or after expiresAt 
     monetaryLimitSats: 1000,
     nowEpochSeconds: () => 1770000010
   });
-  const request = createValidRequest(); // expiresAt: 1770000300
+  const request = createValidRequest({ expiresAt: 1770000200 }); // request.expiresAt < intent.expiresAt (300)
 
-  // Case 1: recordedAt === expiresAt exactly
+  // Case 1: recordedAt === request.expiresAt exactly for approved status
   const mockBoundaryPort: WalletApprovalTransportPort = {
     async sendApprovalRequest(req) {
       return {
@@ -263,7 +263,7 @@ test("WalletApprovalTransport negative: response recorded at or after expiresAt 
         decisionId: req.policyDecision.decisionId,
         status: "approved",
         approver: req.intent.fromAddress,
-        recordedAt: 1770000300 // exactly at expiresAt
+        recordedAt: 1770000200 // exactly at request.expiresAt
       };
     }
   };
@@ -277,8 +277,8 @@ test("WalletApprovalTransport negative: response recorded at or after expiresAt 
     }
   );
 
-  // Case 2: recordedAt > expiresAt for rejected status
-  const request2 = createValidRequest({ requestId: "req-sec-test-002" });
+  // Case 2: recordedAt > request.expiresAt for rejected status (within workflow window)
+  const request2 = createValidRequest({ requestId: "req-sec-test-002", expiresAt: 1770000200 });
   const mockLateRejectedPort: WalletApprovalTransportPort = {
     async sendApprovalRequest(req) {
       return {
@@ -289,7 +289,7 @@ test("WalletApprovalTransport negative: response recorded at or after expiresAt 
         intentId: req.intent.intentId,
         decisionId: req.policyDecision.decisionId,
         status: "rejected",
-        recordedAt: 1770000350 // after expiresAt
+        recordedAt: 1770000250 // after request.expiresAt, before intent.expiresAt
       };
     }
   };
@@ -303,8 +303,8 @@ test("WalletApprovalTransport negative: response recorded at or after expiresAt 
     }
   );
 
-  // Case 3: status === "expired" with recordedAt >= expiresAt succeeds
-  const request3 = createValidRequest({ requestId: "req-sec-test-003" });
+  // Case 3: status === "expired" with recordedAt >= request.expiresAt succeeds within workflow window
+  const request3 = createValidRequest({ requestId: "req-sec-test-003", expiresAt: 1770000200 });
   const mockValidExpiredPort: WalletApprovalTransportPort = {
     async sendApprovalRequest(req) {
       return {
@@ -315,7 +315,7 @@ test("WalletApprovalTransport negative: response recorded at or after expiresAt 
         intentId: req.intent.intentId,
         decisionId: req.policyDecision.decisionId,
         status: "expired",
-        recordedAt: 1770000305
+        recordedAt: 1770000250 // after request.expiresAt, before intent.expiresAt
       };
     }
   };
@@ -818,5 +818,220 @@ test("WalletApprovalTransport P2-3: Dispatch failure rolls back pending reservat
   assert.equal(receipt.status, "approved");
   assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
 });
+
+test("WalletApprovalTransport Gate 2A P2: canonical workflow window boundary enforcement", async () => {
+  const transport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1000,
+    nowEpochSeconds: () => 1770000010
+  });
+
+  // Base request values: requestedAt: 1770000002, expiresAt: 1770000300, intent.expiresAt: 1770000300, policyDecision.expiresAt: 1770000300
+
+  // 1. recordedAt === intent.expiresAt (boundary: exactly at expiry cannot form canonical AgenticWorkflowV1)
+  const reqExactIntentExpiry = createValidRequest({
+    requestId: "req-p2-bound-001",
+    intent: { ...BASE_VALID_INTENT, intentId: "intent-p2-bound-001", nonce: "cDItbm9uY2UtdmFsLTAwMDAwMDAwMDE" },
+    policyDecision: { ...BASE_VALID_POLICY_DECISION, intentId: "intent-p2-bound-001" }
+  });
+  const exactIntentPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-001",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: req.intent.expiresAt // 1770000300
+      };
+    }
+  };
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(reqExactIntentExpiry, exactIntentPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "RESPONSE_OUTSIDE_WORKFLOW_WINDOW");
+      return true;
+    }
+  );
+  // Replay invariant: pending reservation rolled back, committed entry not created
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 0 });
+
+  // 1b. Replay invariant: late-expired rejection did NOT burn requestId, intentId, or nonce.
+  // Immediate retry of the same request with a valid in-window receipt must succeed and commit cleanly.
+  const retryPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-001-retry",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: req.intent.expiresAt - 1 // 1770000299 (in-window)
+      };
+    }
+  };
+  const retryReceipt = await transport.dispatchApprovalRequest(reqExactIntentExpiry, retryPort);
+  assert.equal(retryReceipt.status, "approved");
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // 2. recordedAt > intent.expiresAt
+  const reqAfterIntentExpiry = createValidRequest({
+    requestId: "req-p2-bound-002",
+    intent: { ...BASE_VALID_INTENT, intentId: "intent-p2-bound-002", nonce: "cDItbm9uY2UtdmFsLTAwMDAwMDAwMDI" },
+    policyDecision: { ...BASE_VALID_POLICY_DECISION, intentId: "intent-p2-bound-002" }
+  });
+  const afterIntentPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-002",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: req.intent.expiresAt + 1 // 1770000301
+      };
+    }
+  };
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(reqAfterIntentExpiry, afterIntentPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "RESPONSE_OUTSIDE_WORKFLOW_WINDOW");
+      return true;
+    }
+  );
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // 3. recordedAt === policyDecision.expiresAt (when policyDecision.expiresAt is earlier than intent.expiresAt)
+  const reqPolicyExpiry = createValidRequest({
+    requestId: "req-p2-bound-003",
+    intent: { ...BASE_VALID_INTENT, intentId: "intent-p2-bound-003", nonce: "cDItbm9uY2UtdmFsLTAwMDAwMDAwMDM", expiresAt: 1770000500 },
+    policyDecision: { ...BASE_VALID_POLICY_DECISION, intentId: "intent-p2-bound-003", expiresAt: 1770000250 },
+    expiresAt: 1770000250
+  });
+  const exactPolicyPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-003",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: req.policyDecision.expiresAt // 1770000250 (recordedAt === policyDecision.expiresAt < intent.expiresAt)
+      };
+    }
+  };
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(reqPolicyExpiry, exactPolicyPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "RESPONSE_OUTSIDE_WORKFLOW_WINDOW");
+      return true;
+    }
+  );
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // 4. Late-expired receipt: status === "expired" and recordedAt well beyond boundary
+  const reqLateExpired = createValidRequest({
+    requestId: "req-p2-bound-004",
+    intent: { ...BASE_VALID_INTENT, intentId: "intent-p2-bound-004", nonce: "cDItbm9uY2UtdmFsLTAwMDAwMDAwMDQ" },
+    policyDecision: { ...BASE_VALID_POLICY_DECISION, intentId: "intent-p2-bound-004" }
+  });
+  const lateExpiredPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-004",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: 1770000450 // > 1770000300
+      };
+    }
+  };
+  await assert.rejects(
+    async () => transport.dispatchApprovalRequest(reqLateExpired, lateExpiredPort),
+    (err: unknown) => {
+      assert.ok(err instanceof WalletApprovalTransportError);
+      assert.equal(err.code, "RESPONSE_OUTSIDE_WORKFLOW_WINDOW");
+      return true;
+    }
+  );
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 1 });
+
+  // 5. Valid approved receipt just before the boundary (expiry - 1) to avoid an off-by-one
+  const reqValidApprovedBeforeLimit = createValidRequest({
+    requestId: "req-p2-bound-005",
+    intent: { ...BASE_VALID_INTENT, intentId: "intent-p2-bound-005", nonce: "cDItbm9uY2UtdmFsLTAwMDAwMDAwMDU", expiresAt: 1770000300 },
+    policyDecision: { ...BASE_VALID_POLICY_DECISION, intentId: "intent-p2-bound-005", expiresAt: 1770000300 },
+    expiresAt: 1770000300
+  });
+  const validApprovedPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-005",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: req.intent.expiresAt - 1 // 1770000299 (expiry - 1)
+      };
+    }
+  };
+  const validApprovedReceipt = await transport.dispatchApprovalRequest(
+    reqValidApprovedBeforeLimit,
+    validApprovedPort
+  );
+  assert.equal(validApprovedReceipt.status, "approved");
+  assert.equal(validApprovedReceipt.recordedAt, 1770000299);
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 2 });
+
+  // 6. Valid expired receipt just before the boundary (expiry - 1):
+  // When request.expiresAt < intent.expiresAt (e.g. 200 vs 300), receipt recordedAt 299 is expired relative to request,
+  // but strictly before intent.expiresAt (300), so it is representable by Core agenticWorkflowV1Schema
+  const reqValidExpiredBeforeLimit = createValidRequest({
+    requestId: "req-p2-bound-006",
+    intent: { ...BASE_VALID_INTENT, intentId: "intent-p2-bound-006", nonce: "cDItbm9uY2UtdmFsLTAwMDAwMDAwMDY", expiresAt: 1770000300 },
+    policyDecision: { ...BASE_VALID_POLICY_DECISION, intentId: "intent-p2-bound-006", expiresAt: 1770000300 },
+    expiresAt: 1770000200
+  });
+  const validExpiredPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-p2-006",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: req.intent.expiresAt - 1 // 1770000299 (expiry - 1)
+      };
+    }
+  };
+  const validExpiredReceipt = await transport.dispatchApprovalRequest(
+    reqValidExpiredBeforeLimit,
+    validExpiredPort
+  );
+  assert.equal(validExpiredReceipt.status, "expired");
+  assert.equal(validExpiredReceipt.recordedAt, 1770000299);
+  assert.deepEqual(transport.getReplayCacheStats(), { pending: 0, committed: 3 });
+});
+
 
 

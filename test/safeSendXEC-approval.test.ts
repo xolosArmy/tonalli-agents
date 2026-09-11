@@ -15,6 +15,7 @@ import {
   type HumanApprovalV1,
   type WalletApprovalRequestV1
 } from "@xolosarmy/tonalli-core";
+import type { WalletApprovalTransportPort } from "../src/wallet/approvalTransport";
 
 const FROM_ADDRESS = "ecash:qz2708636snqhsxu8wnlka78h6fdp77ar59j2t0fh2";
 const TO_ADDRESS = "ecash:qp3wjpa3tjlj042z2wv7hah0ldgwhwy0rq9sywjpy5";
@@ -556,4 +557,145 @@ test("Gate 2A P2-2: Error classification - transport failures emit WALLET_APPROV
     "Human rejection must NOT emit POLICY_REJECTED (it is recorded human rejection, not CAE rejection)"
   );
 });
+
+test("Gate 2A P2: Late-expired HumanApproval receipt seam - fail-closed before commitReservation", async () => {
+  const { safeSendXEC } = await import("../src/wallet/safeSendXEC");
+  const {
+    createWalletApprovalTransport,
+    WalletApprovalTransportError
+  } = await import("../src/wallet/approvalTransport");
+  const { onEvent, Topics } = await import("../src/events/bus");
+
+  const emittedEvents: Array<{ topic: string; payload: unknown }> = [];
+  onEvent(Topics.WALLET_APPROVAL_TRANSPORT_FAILED, (payload) => {
+    emittedEvents.push({ topic: Topics.WALLET_APPROVAL_TRANSPORT_FAILED, payload });
+  });
+  onEvent(Topics.POLICY_REJECTED, (payload) => {
+    emittedEvents.push({ topic: Topics.POLICY_REJECTED, payload });
+  });
+  onEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, (payload) => {
+    emittedEvents.push({ topic: Topics.POLICY_NEEDS_HUMAN_APPROVAL, payload });
+  });
+
+  const customTransport = createWalletApprovalTransport({
+    killSwitch: false,
+    monetaryLimitSats: 1_000_000,
+    nowEpochSeconds: () => SIMULATION_NOW
+  });
+
+  // Mock port that returns a late-expired HumanApprovalV1 receipt (status: "expired", recordedAt: SIMULATION_EXPIRES_AT)
+  // where recordedAt is at the intent/policy expiry boundary
+  const lateExpiredPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-late-expired-001",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "expired",
+        recordedAt: req.intent.expiresAt // recordedAt === intent.expiresAt (late-expired boundary)
+      };
+    }
+  };
+
+  emittedEvents.length = 0;
+
+  // 1. CAE returns needs_human_approval
+  // 2. safeSendXEC creates WalletApprovalRequest
+  // 3. Wallet returns HumanApprovalV1 with status: "expired"
+  // 4. recordedAt is set at or after intent/policy expiry
+  // 5. Operation must fail with WalletApprovalTransportError
+  await assert.rejects(
+    async () => {
+      await safeSendXEC(
+        {
+          toAddress: TO_ADDRESS,
+          amountSats: 50_000,
+          reason: "Late-expired receipt reproduction test"
+        },
+        {
+          fromAddress: FROM_ADDRESS,
+          now: () => SIMULATION_NOW,
+          randomId: () => "req-late-exp-001",
+          randomNonce: () => "MDEyMzQ1Njc4OWFiY2RlZg",
+          requestPolicy: async (candidate) =>
+            createNeedsApprovalPolicyDecision(candidate.intentId),
+          walletApprovalPort: lateExpiredPort,
+          walletTransport: customTransport
+        }
+      );
+    },
+    (err: unknown) => {
+      assert.ok(
+        err instanceof WalletApprovalTransportError ||
+        (err instanceof Error && err.name === "WalletApprovalTransportError"),
+        "Must be a WalletApprovalTransportError"
+      );
+      assert.equal((err as any).code, "RESPONSE_OUTSIDE_WORKFLOW_WINDOW");
+      return true;
+    }
+  );
+
+  // 6. Must emit WALLET_APPROVAL_TRANSPORT_FAILED
+  const transportFailedEvent = emittedEvents.find(
+    (e) => e.topic === Topics.WALLET_APPROVAL_TRANSPORT_FAILED
+  );
+  assert.ok(transportFailedEvent, "Must emit WALLET_APPROVAL_TRANSPORT_FAILED");
+  assert.equal((transportFailedEvent.payload as any)?.code, "RESPONSE_OUTSIDE_WORKFLOW_WINDOW");
+
+  // 7. Must NOT emit POLICY_REJECTED
+  assert.equal(
+    emittedEvents.some((e) => e.topic === Topics.POLICY_REJECTED),
+    false,
+    "Must NOT emit POLICY_REJECTED on late-expired receipt transport error"
+  );
+
+  // 8. Replay state must have rolled back and not committed: pending=0, committed=0
+  const replayStats = customTransport.getReplayCacheStats();
+  assert.equal(replayStats.pending, 0, "Pending reservations must be 0 after rollback");
+  assert.equal(replayStats.committed, 0, "Committed entries must be 0 (must not commit invalid receipt)");
+
+  // 9. Replay invariant: request was NOT burned. A subsequent dispatch with valid in-window receipt succeeds
+  const validInWindowPort: WalletApprovalTransportPort = {
+    async sendApprovalRequest(req) {
+      return {
+        contractVersion: AGENTIC_CONTRACT_VERSION,
+        kind: "human_approval",
+        approvalId: "appr-valid-retry-001",
+        requestId: req.requestId,
+        intentId: req.intent.intentId,
+        decisionId: req.policyDecision.decisionId,
+        status: "approved",
+        approver: req.intent.fromAddress,
+        recordedAt: req.intent.expiresAt - 1 // strictly before expiry
+      };
+    }
+  };
+
+  const retryResult = await safeSendXEC(
+    {
+      toAddress: TO_ADDRESS,
+      amountSats: 50_000,
+      reason: "Retry after late-expired rollback"
+    },
+    {
+      fromAddress: FROM_ADDRESS,
+      now: () => SIMULATION_NOW,
+      randomId: () => "req-late-exp-001", // same requestId
+      randomNonce: () => "MDEyMzQ1Njc4OWFiY2RlZg", // same nonce
+      requestPolicy: async (candidate) =>
+        createNeedsApprovalPolicyDecision(candidate.intentId),
+      walletApprovalPort: validInWindowPort,
+      walletTransport: customTransport
+    }
+  );
+
+  assert.equal(retryResult.status, "human_approval_recorded");
+  const finalReplayStats = customTransport.getReplayCacheStats();
+  assert.equal(finalReplayStats.pending, 0);
+  assert.equal(finalReplayStats.committed, 1, "Successful retry now commits reservation");
+});
+
 
