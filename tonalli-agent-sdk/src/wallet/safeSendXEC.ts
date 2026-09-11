@@ -2,11 +2,17 @@ import { randomUUID } from "node:crypto";
 import {
   AGENTIC_CONTRACT_VERSION,
   parseAgenticWorkflowV1,
-  parseWalletApprovalRequestV1
+  parseWalletApprovalRequestV1,
+  type HumanApprovalV1
 } from "@xolosarmy/tonalli-core";
 import { enforcePreflight } from "../cae/policyGuard";
 import type { PreflightRequester } from "../cae/policyGuard";
 import { emitEvent, Topics } from "../events/bus";
+import {
+  createWalletApprovalTransport,
+  WalletApprovalTransportError,
+  type WalletApprovalTransportPort
+} from "./approvalTransport";
 import {
   createAgentPaymentIntent,
   type AgentPaymentIntentInput,
@@ -15,6 +21,8 @@ import {
 
 export interface SafeSendDependencies extends IntentFactoryOptions {
   requestPolicy?: PreflightRequester;
+  walletApprovalPort?: WalletApprovalTransportPort;
+  walletTransport?: ReturnType<typeof createWalletApprovalTransport>;
 }
 
 const signingNotAttempted = (intentId: string) => ({
@@ -99,25 +107,84 @@ export async function safeSendXEC(
         requestedAt,
         expiresAt
       });
+
+      if (dependencies.walletApprovalPort && !dependencies.walletTransport) {
+        throw new WalletApprovalTransportError(
+          "MISSING_WALLET_TRANSPORT",
+          "walletApprovalPort was provided without a preconfigured walletTransport. Fail-closed: transport must be explicitly composed."
+        );
+      }
+
+      if (dependencies.walletTransport) {
+        dependencies.walletTransport.validateOutboundRequest(walletApprovalRequest);
+      }
+
+      emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
+        intentId: intent.intentId,
+        requestId: walletApprovalRequest.requestId,
+        policyTraceId: policyDecision.policyTraceId
+      });
+
+      let humanApproval: HumanApprovalV1 | undefined;
+      if (dependencies.walletApprovalPort && dependencies.walletTransport) {
+        humanApproval = await dependencies.walletTransport.dispatchApprovalRequest(
+          walletApprovalRequest,
+          dependencies.walletApprovalPort
+        );
+      }
+
       const workflow = parseAgenticWorkflowV1({
         contractVersion: AGENTIC_CONTRACT_VERSION,
         kind: "agentic_workflow",
         intent,
         policyDecision,
         walletApprovalRequest,
+        ...(humanApproval ? { humanApproval } : {}),
         ...stoppedStages
       });
-      emitEvent(Topics.POLICY_NEEDS_HUMAN_APPROVAL, {
-        intentId: intent.intentId,
-        requestId: walletApprovalRequest.requestId,
-        policyTraceId: policyDecision.policyTraceId
-      });
+
+      if (!humanApproval) {
+        return {
+          status: "needs_human_approval" as const,
+          simulation: true as const,
+          intent,
+          policyDecision,
+          walletApprovalRequest,
+          workflow
+        };
+      }
+
+      if (humanApproval.status === "approved") {
+        return {
+          status: "human_approval_recorded" as const,
+          simulation: true as const,
+          intent,
+          policyDecision,
+          walletApprovalRequest,
+          humanApproval,
+          workflow
+        };
+      }
+
+      if (humanApproval.status === "rejected") {
+        return {
+          status: "rejected" as const,
+          simulation: true as const,
+          intent,
+          policyDecision,
+          walletApprovalRequest,
+          humanApproval,
+          workflow
+        };
+      }
+
       return {
-        status: "needs_human_approval" as const,
+        status: "expired" as const,
         simulation: true as const,
         intent,
         policyDecision,
         walletApprovalRequest,
+        humanApproval,
         workflow
       };
     }
@@ -144,10 +211,27 @@ export async function safeSendXEC(
       workflow
     };
   } catch (error: any) {
-    emitEvent(Topics.POLICY_REJECTED, {
-      intentId: intent.intentId,
-      error: error instanceof Error ? error.message : "Unknown fail-closed error"
-    });
+    if (
+      error instanceof WalletApprovalTransportError ||
+      (error instanceof Error && error.name === "WalletApprovalTransportError")
+    ) {
+      const transportCode =
+        error instanceof WalletApprovalTransportError
+          ? error.code
+          : "code" in error && typeof (error as any).code === "string"
+            ? (error as any).code
+            : "UNKNOWN_TRANSPORT_ERROR";
+      emitEvent(Topics.WALLET_APPROVAL_TRANSPORT_FAILED, {
+        intentId: intent.intentId,
+        code: transportCode,
+        error: error.message
+      });
+    } else {
+      emitEvent(Topics.POLICY_REJECTED, {
+        intentId: intent.intentId,
+        error: error instanceof Error ? error.message : "Unknown fail-closed error"
+      });
+    }
     throw error;
   }
 }
