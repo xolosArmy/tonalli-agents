@@ -1,7 +1,7 @@
 /**
  * @file approvalTransport.ts
  *
- * CANONICAL AGENT-SIDE WALLET APPROVAL OUTBOUND TRANSPORT (Gate 2A)
+ * CANONICAL AGENT-SIDE WALLET APPROVAL OUTBOUND TRANSPORT (Gate 2A & Durable CAE State)
  *
  * Authority Boundary:
  * - Agents PRODUCE and TRANSPORT WalletApprovalRequestV1 envelopes.
@@ -10,6 +10,15 @@
  * - Agents RECEIVE subsequent HumanApprovalV1 responses issued by Wallet and validate bindings.
  * - Agents CANNOT create HumanApprovalV1, generate approvalId, accept human decisions directly,
  *   represent Wallet UI, or execute/sign/broadcast transactions.
+ *
+ * Authoritative Durable Coordination Boundary:
+ * - Backed by an ACID DurableAuthorizationStore (SQLite WAL reference adapter or distributed backend).
+ * - Multi-instance and cross-process safety: replay prevention, nonce uniqueness, atomic concurrent
+ *   reservation exclusion, cumulative daily authorization limits, and lease-fencing recovery
+ *   are all enforced at the durable store layer under database constraints.
+ * - No correctness guarantee relies on process-local JavaScript Maps or Sets.
+ * - Fail-closed: if the durable store is unavailable, locked, corrupt, or uncertain,
+ *   authorization fails closed immediately. Zero silent fallback to volatile state in durable mode.
  *
  * Network Domain Status:
  * BLOCKED_BY_CORE_NETWORK_DOMAIN
@@ -22,10 +31,11 @@
  * Hardened Receipt & Audit Boundary:
  * - HumanApprovalV1 is strictly an auditable receipt/audit artifact, NEVER a signing authorization
  *   or portable execution capability.
- * - Agents NEVER receives WalletLocalApprovalBinding nor ApprovalRecordCapability.
+ * - Agents NEVER receive WalletLocalApprovalBinding nor ApprovalRecordCapability.
  * - A mock port that returns `approved` does NOT enable financial execution.
  */
 
+import { randomUUID } from "node:crypto";
 import {
   AGENTIC_CONTRACT_VERSION,
   humanApprovalV1Schema,
@@ -34,6 +44,17 @@ import {
   type WalletApprovalRequestV1
 } from "@xolosarmy/tonalli-core";
 import { formatSatsToExactXEC } from "./format";
+import {
+  createSqliteDurableStore,
+  DurableStoreError,
+  formatSpendingKey,
+  getDeterministicUtcDateString,
+  type DailySpendingStats,
+  type DurableAuthorizationStore,
+  type DurableReplayIdentifiers,
+  type DurableReservationHandle,
+  type DurableSpendingIdentity
+} from "../durableStore";
 
 export const parseHumanApprovalV1 = (value: unknown): HumanApprovalV1 =>
   humanApprovalV1Schema.parse(value);
@@ -57,7 +78,10 @@ export type WalletApprovalTransportErrorCode =
   | "RESPONSE_BINDING_MISMATCH"
   | "RESPONSE_EXPIRED_MISMATCH"
   | "RESPONSE_OUTSIDE_WORKFLOW_WINDOW"
-  | "INVALID_CLOCK";
+  | "INVALID_CLOCK"
+  | "STORE_UNAVAILABLE"
+  | "LEASE_EXPIRED"
+  | "LEASE_SUPERSEDED";
 
 export class WalletApprovalTransportError extends Error {
   readonly code: WalletApprovalTransportErrorCode;
@@ -101,9 +125,34 @@ export interface WalletApprovalTransportConfig {
    */
   monetaryLimitSats?: number | bigint;
   /**
+   * Alias for cumulative daily limit in satoshis. Defaults to monetaryLimitSats ?? 0.
+   */
+  dailyLimitSats?: number | bigint;
+  /**
    * Injectable clock provider for deterministic testing. Defaults to Date.now() / 1000.
    */
   nowEpochSeconds?: () => number;
+  /**
+   * Authoritative durable authorization store.
+   * If omitted, an in-process SQLite store (:memory:) is created for local testing/simulation.
+   */
+  durableStore?: DurableAuthorizationStore;
+  /**
+   * Path to SQLite database file on disk if durableStore is not directly supplied.
+   */
+  dbPath?: string;
+  /**
+   * Worker/instance identity for reservation lease ownership. Defaults to auto-generated UUID.
+   */
+  ownerId?: string;
+  /**
+   * Lease duration in seconds for pending reservations before stale recovery. Defaults to 60s.
+   */
+  leaseDurationSeconds?: number;
+  /**
+   * Explicit flag indicating in-memory development or simulation mode.
+   */
+  simulationMode?: boolean;
 }
 
 export interface WalletApprovalAuditDisplay {
@@ -133,20 +182,42 @@ export interface WalletApprovalTransport {
     requestInput: unknown,
     port: WalletApprovalTransportPort
   ) => Promise<HumanApprovalV1>;
-  readonly pruneExpired: () => number;
-  readonly getReplayCacheStats: () => { pending: number; committed: number };
+  readonly pruneExpired: () => number | Promise<number>;
+  readonly getReplayCacheStats: () => { pending: number; committed: number } | Promise<{ pending: number; committed: number }>;
+  readonly getDailySpending?: (
+    spending: DurableSpendingIdentity,
+    utcDate?: string
+  ) => DailySpendingStats | Promise<DailySpendingStats>;
+  readonly durableStore?: DurableAuthorizationStore;
 }
 
 /**
  * Creates an outbound transport client for dispatching canonical WalletApprovalRequestV1
- * envelopes from Agents to Wallet without assuming approval authority.
+ * envelopes from Agents to Wallet with authoritative durable CAE state.
  */
 export function createWalletApprovalTransport(
   config: WalletApprovalTransportConfig = {}
 ): WalletApprovalTransport {
   const killSwitch = config.killSwitch ?? true;
-  const monetaryLimitSats = BigInt(config.monetaryLimitSats ?? 0);
+  const monetaryLimitSats = config.monetaryLimitSats !== undefined
+    ? BigInt(config.monetaryLimitSats)
+    : config.dailyLimitSats !== undefined
+      ? BigInt(config.dailyLimitSats)
+      : 0n;
+  const dailyLimitSats = config.dailyLimitSats !== undefined
+    ? BigInt(config.dailyLimitSats)
+    : undefined;
   const getNow = config.nowEpochSeconds ?? (() => Math.floor(Date.now() / 1000));
+  const ownerId = config.ownerId ?? `worker-${randomUUID()}`;
+  const leaseDurationSeconds = config.leaseDurationSeconds ?? 60;
+
+  // Authoritative durable state store: SQLite reference adapter by default
+  const durableStore: DurableAuthorizationStore =
+    config.durableStore ??
+    createSqliteDurableStore({
+      dbPath: config.dbPath ?? ":memory:",
+      isSimulation: !config.dbPath
+    });
 
   function getValidNowEpochSeconds(): number {
     const now = getNow();
@@ -163,96 +234,6 @@ export function createWalletApprovalTransport(
       );
     }
     return now;
-  }
-
-  /**
-   * BOUNDED IN-MEMORY REPLAY CACHE (NON-DURABLE FALLBACK)
-   *
-   * CRITICAL SECURITY BOUNDARY NOTE:
-   * This in-memory cache bounds heap memory growth in long-running processes by
-   * pruning committed entries whose canonical validity window (expiresAt) has elapsed.
-   *
-   * WARNING: This retention is STRICTLY PROCESS-LOCAL AND VOLATILE.
-   * It does NOT provide durable replay protection across restarts, multi-instance
-   * deployments, horizontal scaling, or real-funds settlement. Durable replay
-   * protection and atomic state transitions must be enforced by the shared
-   * transactional CAE store and the Wallet-owned authorization ledger.
-   */
-  interface CommittedReplayEntry {
-    readonly requestId: string;
-    readonly intentId: string;
-    readonly nonce: string;
-    readonly expiresAt: number;
-  }
-
-  const pendingReservations = new Map<
-    string,
-    { intentId: string; nonce: string; expiresAt: number }
-  >();
-  const committedEntries = new Map<string, CommittedReplayEntry>();
-  const committedIntentIndex = new Map<string, string>();
-  const committedNonceIndex = new Map<string, string>();
-
-  function pruneExpiredEntries(currentEpoch: number): number {
-    let prunedCount = 0;
-    for (const [requestId, entry] of committedEntries.entries()) {
-      if (entry.expiresAt <= currentEpoch) {
-        committedEntries.delete(requestId);
-        committedIntentIndex.delete(entry.intentId);
-        committedNonceIndex.delete(entry.nonce);
-        prunedCount++;
-      }
-    }
-    return prunedCount;
-  }
-
-  function reserveRequest(
-    requestId: string,
-    intentId: string,
-    nonce: string,
-    expiresAt: number,
-    now: number
-  ): void {
-    pruneExpiredEntries(now);
-
-    if (
-      committedEntries.has(requestId) ||
-      committedIntentIndex.has(intentId) ||
-      committedNonceIndex.has(nonce)
-    ) {
-      throw new WalletApprovalTransportError(
-        "REPLAY_DETECTED",
-        `Outbound request identifier or nonce has already been committed in this process`
-      );
-    }
-    for (const [pReqId, pVal] of pendingReservations.entries()) {
-      if (pReqId === requestId || pVal.intentId === intentId || pVal.nonce === nonce) {
-        throw new WalletApprovalTransportError(
-          "REPLAY_DETECTED",
-          `Outbound request identifier or nonce is already pending dispatch in this process`
-        );
-      }
-    }
-    pendingReservations.set(requestId, { intentId, nonce, expiresAt });
-  }
-
-  function commitReservation(requestId: string): void {
-    const reserved = pendingReservations.get(requestId);
-    if (reserved) {
-      pendingReservations.delete(requestId);
-      committedEntries.set(requestId, {
-        requestId,
-        intentId: reserved.intentId,
-        nonce: reserved.nonce,
-        expiresAt: reserved.expiresAt
-      });
-      committedIntentIndex.set(reserved.intentId, requestId);
-      committedNonceIndex.set(reserved.nonce, requestId);
-    }
-  }
-
-  function rollbackReservation(requestId: string): void {
-    pendingReservations.delete(requestId);
   }
 
   /**
@@ -327,6 +308,12 @@ export function createWalletApprovalTransport(
         `Requested amount (${parsed.intent.amountSats} sats) exceeds agent monetary limit (${monetaryLimitSats} sats)`
       );
     }
+    if (dailyLimitSats !== undefined && intentSats > dailyLimitSats) {
+      throw new WalletApprovalTransportError(
+        "MONETARY_LIMIT_EXCEEDED",
+        `Requested amount (${parsed.intent.amountSats} sats) exceeds agent daily limit (${dailyLimitSats} sats)`
+      );
+    }
 
     const now = getValidNowEpochSeconds();
     if (parsed.requestedAt > now + 60) {
@@ -374,7 +361,7 @@ export function createWalletApprovalTransport(
 
   /**
    * Dispatches a canonical request to the Wallet port and verifies the resulting
-   * HumanApprovalV1 artifact without assuming local approval authority.
+   * HumanApprovalV1 artifact under durable ACID reservation and fencing.
    */
   async function dispatchApprovalRequest(
     requestInput: unknown,
@@ -383,20 +370,95 @@ export function createWalletApprovalTransport(
     const validatedRequest = validateOutboundRequest(requestInput);
     const now = getValidNowEpochSeconds();
 
-    reserveRequest(
-      validatedRequest.requestId,
-      validatedRequest.intent.intentId,
-      validatedRequest.intent.nonce,
-      validatedRequest.expiresAt,
-      now
-    );
+    // Replay identities to coordinate durably
+    const replayIdentifiers: DurableReplayIdentifiers = {
+      requestId: validatedRequest.requestId,
+      intentId: validatedRequest.intent.intentId,
+      intentNonce: validatedRequest.intent.nonce,
+      ...(validatedRequest.x402?.invoiceHash ? { x402InvoiceHash: validatedRequest.x402.invoiceHash } : {}),
+      ...(validatedRequest.x402?.nonce ? { x402Nonce: validatedRequest.x402.nonce } : {})
+    };
+
+    const spendingIdentity: DurableSpendingIdentity = {
+      agentId: validatedRequest.intent.agentId,
+      fromAddress: validatedRequest.intent.fromAddress,
+      network: validatedRequest.intent.network
+    };
+
+    // Atomically reserve replay identities AND cumulative daily monetary budget
+    let reservationHandle: DurableReservationHandle;
+    try {
+      reservationHandle = await durableStore.reserveAuthorization({
+        identifiers: replayIdentifiers,
+        spending: spendingIdentity,
+        amountSats: BigInt(validatedRequest.intent.amountSats),
+        ...(dailyLimitSats !== undefined ? { dailyLimitSats } : {}),
+        requestRequestedAt: validatedRequest.requestedAt,
+        requestExpiresAt: validatedRequest.expiresAt,
+        nowEpochSeconds: now,
+        ownerId,
+        leaseDurationSeconds
+      });
+    } catch (err) {
+      if (err instanceof DurableStoreError) {
+        if (err.code === "REPLAY_DETECTED") {
+          throw new WalletApprovalTransportError(
+            "REPLAY_DETECTED",
+            `Outbound request identifier or nonce has already been committed or is pending dispatch: ${err.message}`,
+            err
+          );
+        }
+        if (err.code === "MONETARY_LIMIT_EXCEEDED") {
+          throw new WalletApprovalTransportError(
+            "MONETARY_LIMIT_EXCEEDED",
+            `Requested amount exceeds cumulative daily limit: ${err.message}`,
+            err
+          );
+        }
+        if (err.code === "INVALID_CLOCK") {
+          throw new WalletApprovalTransportError(
+            "INVALID_CLOCK",
+            err.message,
+            err
+          );
+        }
+        throw new WalletApprovalTransportError(
+          "STORE_UNAVAILABLE",
+          `Durable state operation failed: ${err.message}`,
+          err
+        );
+      }
+      throw new WalletApprovalTransportError(
+        "STORE_UNAVAILABLE",
+        `Durable state store threw unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+        err
+      );
+    }
+
+    // Helper to safely roll back and fail closed
+    const rollbackAndFail = async (
+      code: WalletApprovalTransportErrorCode,
+      message: string,
+      details?: unknown
+    ): Promise<never> => {
+      try {
+        await durableStore.rollbackAuthorization({
+          reservationId: reservationHandle.reservationId,
+          leaseToken: reservationHandle.leaseToken,
+          nowEpochSeconds: getValidNowEpochSeconds(),
+          reason: code
+        });
+      } catch (rollbackErr) {
+        // Rollback failure is logged/attached to details
+      }
+      throw new WalletApprovalTransportError(code, message, details);
+    };
 
     let walletResponse: unknown;
     try {
       walletResponse = await port.sendApprovalRequest(validatedRequest);
     } catch (err) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "PORT_DISPATCH_FAILED",
         `Wallet transport port failed to dispatch request: ${err instanceof Error ? err.message : String(err)}`,
         err
@@ -407,8 +469,7 @@ export function createWalletApprovalTransport(
     try {
       parsedResponse = parseHumanApprovalV1(walletResponse);
     } catch (err) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "INVALID_RESPONSE_SCHEMA",
         "Wallet response is not a valid HumanApprovalV1 artifact",
         err
@@ -416,40 +477,35 @@ export function createWalletApprovalTransport(
     }
 
     if (parsedResponse.contractVersion !== AGENTIC_CONTRACT_VERSION) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_BINDING_MISMATCH",
         `Wallet response contractVersion (${parsedResponse.contractVersion}) does not match expected (${AGENTIC_CONTRACT_VERSION})`
       );
     }
 
     if (parsedResponse.requestId !== validatedRequest.requestId) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_BINDING_MISMATCH",
         `Wallet response requestId (${parsedResponse.requestId}) does not match outbound request (${validatedRequest.requestId})`
       );
     }
 
     if (parsedResponse.intentId !== validatedRequest.intent.intentId) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_BINDING_MISMATCH",
         `Wallet response intentId (${parsedResponse.intentId}) does not match outbound intent (${validatedRequest.intent.intentId})`
       );
     }
 
     if (parsedResponse.decisionId !== validatedRequest.policyDecision.decisionId) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_BINDING_MISMATCH",
         `Wallet response decisionId (${parsedResponse.decisionId}) does not match outbound policy decision (${validatedRequest.policyDecision.decisionId})`
       );
     }
 
     if (parsedResponse.recordedAt < validatedRequest.requestedAt) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_BINDING_MISMATCH",
         `Wallet response recordedAt (${parsedResponse.recordedAt}) cannot precede requestedAt (${validatedRequest.requestedAt})`
       );
@@ -457,8 +513,7 @@ export function createWalletApprovalTransport(
 
     if (parsedResponse.status === "approved") {
       if (!parsedResponse.approver || parsedResponse.approver !== validatedRequest.intent.fromAddress) {
-        rollbackReservation(validatedRequest.requestId);
-        throw new WalletApprovalTransportError(
+        return rollbackAndFail(
           "RESPONSE_BINDING_MISMATCH",
           `Approved response approver (${parsedResponse.approver ?? "undefined"}) does not match intent fromAddress (${validatedRequest.intent.fromAddress})`
         );
@@ -474,8 +529,7 @@ export function createWalletApprovalTransport(
       parsedResponse.recordedAt >= validatedRequest.intent.expiresAt ||
       parsedResponse.recordedAt >= validatedRequest.policyDecision.expiresAt
     ) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_OUTSIDE_WORKFLOW_WINDOW",
         `Wallet response recordedAt (${parsedResponse.recordedAt}) exceeds canonical workflow validity window (intent.expiresAt=${validatedRequest.intent.expiresAt}, policyDecision.expiresAt=${validatedRequest.policyDecision.expiresAt}, boundary=${canonicalWorkflowExpiry}). Receipt cannot form a canonical AgenticWorkflowV1.`
       );
@@ -485,14 +539,46 @@ export function createWalletApprovalTransport(
       parsedResponse.recordedAt >= validatedRequest.expiresAt &&
       parsedResponse.status !== "expired"
     ) {
-      rollbackReservation(validatedRequest.requestId);
-      throw new WalletApprovalTransportError(
+      return rollbackAndFail(
         "RESPONSE_EXPIRED_MISMATCH",
         `Wallet response recorded at or after request expiry (${validatedRequest.expiresAt}) must have status 'expired', got '${parsedResponse.status}'`
       );
     }
 
-    commitReservation(validatedRequest.requestId);
+    // Terminal commit transition:
+    // If approved: commits authorized budget.
+    // If rejected/expired: locks replay identity to prevent re-dispatch while releasing budget.
+    try {
+      await durableStore.commitAuthorization({
+        reservationId: reservationHandle.reservationId,
+        leaseToken: reservationHandle.leaseToken,
+        nowEpochSeconds: getValidNowEpochSeconds(),
+        approvalStatus: parsedResponse.status
+      });
+    } catch (err) {
+      if (err instanceof DurableStoreError) {
+        if (err.code === "LEASE_EXPIRED") {
+          throw new WalletApprovalTransportError(
+            "LEASE_EXPIRED",
+            `Reservation lease expired before commit could complete: ${err.message}`,
+            err
+          );
+        }
+        if (err.code === "LEASE_SUPERSEDED") {
+          throw new WalletApprovalTransportError(
+            "LEASE_SUPERSEDED",
+            `Reservation lease was superseded or invalidated: ${err.message}`,
+            err
+          );
+        }
+      }
+      throw new WalletApprovalTransportError(
+        "STORE_UNAVAILABLE",
+        `Failed to commit reservation in durable store: ${err instanceof Error ? err.message : String(err)}`,
+        err
+      );
+    }
+
     return parsedResponse;
   }
 
@@ -500,10 +586,25 @@ export function createWalletApprovalTransport(
     validateOutboundRequest,
     formatAuditDisplay,
     dispatchApprovalRequest,
-    pruneExpired: () => pruneExpiredEntries(getValidNowEpochSeconds()),
-    getReplayCacheStats: () => ({
-      pending: pendingReservations.size,
-      committed: committedEntries.size
-    })
+    pruneExpired: () => {
+      const now = getValidNowEpochSeconds();
+      return durableStore.pruneExpired({ nowEpochSeconds: now });
+    },
+    getReplayCacheStats: () => {
+      const stats = durableStore.getStats();
+      if (stats instanceof Promise) {
+        return stats.then((s) => ({ pending: s.pending, committed: s.committed }));
+      }
+      return {
+        pending: stats.pending,
+        committed: stats.committed
+      };
+    },
+    getDailySpending: (spending: DurableSpendingIdentity, utcDate?: string) => {
+      const now = getValidNowEpochSeconds();
+      const date = utcDate ?? getDeterministicUtcDateString(now);
+      return durableStore.getDailySpending(spending, date, now);
+    },
+    durableStore
   };
 }

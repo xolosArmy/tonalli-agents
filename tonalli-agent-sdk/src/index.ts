@@ -10,3 +10,4 @@ export * from "./wallet/preflightSendXEC";
 export * from "./wallet/sessionSigner";
 export * from "./wallet/intent";
 export * from "./wallet/approvalTransport";
+export * from "./durableStore";

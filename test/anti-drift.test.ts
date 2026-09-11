@@ -14,7 +14,11 @@ const CORE_SECURITY_MODULES = [
   "wallet/sessionSigner.ts",
   "wallet/intent.ts",
   "cae/policyGuard.ts",
-  "cae/preflightClient.ts"
+  "cae/preflightClient.ts",
+  "durableStore/types.ts",
+  "durableStore/errors.ts",
+  "durableStore/sqliteStore.ts",
+  "durableStore/index.ts"
 ];
 
 test("Anti-drift: core security and wallet modules in src/ and tonalli-agent-sdk/src/ must be strictly identical", () => {
